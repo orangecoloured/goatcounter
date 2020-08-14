@@ -24,6 +24,7 @@ require (
 	honnef.co/go/tools v0.1.0
 	zgo.at/blackmail v0.0.0-20200703094839-f1e44ef1dbb8
 	zgo.at/errors v0.0.0-20200725175708-8255739ad6ec
+	zgo.at/follow v0.0.0-20200726141605-9139f5fe5857
 	zgo.at/gadget v0.0.0-20201217063255-80176bd17067
 	zgo.at/guru v1.1.0
 	zgo.at/isbot v0.0.0-20201217063241-a1aab44f6889

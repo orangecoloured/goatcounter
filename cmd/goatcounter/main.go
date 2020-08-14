@@ -47,6 +47,7 @@ var usage = map[string]string{
 	"database": helpDatabase,
 	"db":       helpDatabase,
 	"listen":   helpListen,
+	"logfile":  helpLogfile,
 
 	"version": `
 Show version and build information. This is printed as key=value, separated by
@@ -67,7 +68,7 @@ Commands:
   migrate      Run database migrations.
   create       Create a new site and user.
   serve        Start HTTP server.
-  import       Import pageviews from export.
+  import       Import pageviews from an export or logfile.
 
 Advanced commands:
   reindex      Recreate the index tables (*_stats, *_count) from the hits.
@@ -77,6 +78,7 @@ Advanced commands:
 
 Extra help topics:
   listen       Detailed documentation on -listen, -tls.
+  logfile      Documentation on importing from logfiles.
 
 See "help <topic>" for more details for the command.
 `
@@ -163,12 +165,12 @@ func flagDebug() *string { return CommandLine.String("debug", "", "") }
 func connectDB(connect string, migrate []string, create bool) (*sqlx.DB, error) {
 	pgSQL := strings.HasPrefix(connect, "postgresql://") || strings.HasPrefix(connect, "postgres://")
 
-	opts := zdb.ConnectOptions{
-		Connect: connect,
-		Migrate: zdb.NewMigrate(nil, migrate,
+	opts := zdb.ConnectOptions{Connect: connect}
+	if migrate != nil {
+		opts.Migrate = zdb.NewMigrate(nil, migrate,
 			map[bool]map[string][]byte{true: pack.MigrationsPgSQL, false: pack.MigrationsSQLite}[pgSQL],
 			gomig.Migrations,
-			map[bool]string{true: "db/migrate/pgsql", false: "db/migrate/sqlite"}[pgSQL]),
+			map[bool]string{true: "db/migrate/pgsql", false: "db/migrate/sqlite"}[pgSQL])
 	}
 	if create {
 		opts.Schema = map[bool][]byte{true: pack.SchemaPgSQL, false: pack.SchemaSQLite}[pgSQL]
