@@ -109,7 +109,11 @@ func addctx(db zdb.DB, loadSite bool) func(http.Handler) http.Handler {
 			// Add timeout on non-admin pages.
 			if !strings.HasPrefix(r.URL.Path, "/admin") {
 				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(r.Context(), 20*time.Second)
+				if r.Host == "teamkodi.goatcounter.com" {
+					ctx, cancel = context.WithTimeout(r.Context(), 30*time.Second)
+				} else {
+					ctx, cancel = context.WithTimeout(r.Context(), 5*time.Second)
+				}
 				defer func() {
 					cancel()
 					if ctx.Err() == context.DeadlineExceeded {
