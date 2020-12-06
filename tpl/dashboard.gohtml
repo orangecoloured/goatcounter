@@ -1,13 +1,5 @@
 {{- template "_backend_top.gohtml" . -}}
 
-<div class="flash flash-i">
-	<p style="margin:0"><strong>Planned database maintenance</strong><br>
-	I need to do some database maintenance, which will make the backend UI
-	unavailable for a few hours. This is planned on Sunday (Dec 6th), starting
-	at about 3am UTC. Pageviews will still be recorded; it's just the backend UI
-	that won't be available.</p>
-</div>
-
 {{if .User.ID}}
 	{{if not .User.EmailVerified}}
 		<div class="flash flash-i">
