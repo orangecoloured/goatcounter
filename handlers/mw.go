@@ -112,7 +112,7 @@ func addctx(db zdb.DB, loadSite bool) func(http.Handler) http.Handler {
 				if r.Host == "teamkodi.goatcounter.com" {
 					ctx, cancel = context.WithTimeout(r.Context(), 30*time.Second)
 				} else {
-					ctx, cancel = context.WithTimeout(r.Context(), 5*time.Second)
+					ctx, cancel = context.WithTimeout(r.Context(), 10*time.Second)
 				}
 				defer func() {
 					cancel()

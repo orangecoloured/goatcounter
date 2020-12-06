@@ -6,6 +6,52 @@ but not every minor bugfix.
 
 The goatcounter.com service generally runs the latest master.
 
+Unreleased v1.5.0
+-----------------
+
+This release contains quite a few changes to the database layout (#383);
+functional changes:
+
+- Some queries are a bit faster, others a bit slower.
+- The Browsers, systems, size, and location stats are filtered if you enter
+  something in "filter paths".
+- Greatly decreases disk storage requirements.
+
+**Action required**:
+
+1. Run the migrations with `goatcounter serve -automigrate` or `goatcounter
+   migrate`.
+
+2. You probably want to manually run `VACUUM` (or `VACUUM FULL` for PostgreSQL)
+   after the migration to free up unused rows. This isn't required though; it
+   just frees up disk space.
+
+3. Run `goatcounter reindex`.
+
+This may take a while if you've got a lot of data. For about 500,000 pageviews
+it takes about 3 minutes on SQLite, but if you've got millions of pageviews it
+may take an hour or more.
+
+What does all of this give you?
+
+- Somewhat faster queries.
+- Greatly reduced disk space requirements for the database.
+- The browser, system, size, and location numbers are now stored per-path, so if
+  you filter to just one page or a set of pages you see the numbers for just
+  those pages.
+- "Purge path" now works as expected for all stats (fixes #96).
+- Easier to add new statistics in the future.
+
+Because this is such a big change there are no changes other than this for
+version 1.5.
+
+**Note**: the CSV export format was increased to `2`; it now includes the parsed
+browser and system values in addition to the User-Agent header. Version 1.5 will
+not be able to import the older exports from version `1`.
+
+
+
+
 2020-11-10, v1.4.2
 ------------------
 

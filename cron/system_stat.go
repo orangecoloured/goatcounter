@@ -6,9 +6,9 @@ package cron
 
 import (
 	"context"
+	"strconv"
 
 	"zgo.at/errors"
-	"zgo.at/gadget"
 	"zgo.at/goatcounter"
 	"zgo.at/zdb"
 	"zgo.at/zdb/bulk"
@@ -16,13 +16,12 @@ import (
 
 func updateSystemStats(ctx context.Context, hits []goatcounter.Hit, isReindex bool) error {
 	return zdb.TX(ctx, func(ctx context.Context, tx zdb.DB) error {
-		// Group by day + system.
 		type gt struct {
 			count       int
 			countUnique int
 			day         string
-			system      string
-			version     string
+			systemID    int64
+			pathID      int64
 		}
 		grouped := map[string]gt{}
 		for _, h := range hits {
@@ -30,22 +29,21 @@ func updateSystemStats(ctx context.Context, hits []goatcounter.Hit, isReindex bo
 				continue
 			}
 
-			system, version := getSystem(h.Browser)
-			if system == "" {
-				continue
+			if h.SystemID == 0 {
+				_, h.SystemID = getUA(ctx, h.UserAgentID)
 			}
 
 			day := h.CreatedAt.Format("2006-01-02")
-			k := day + system + version
+			k := day + strconv.FormatInt(h.SystemID, 10) + strconv.FormatInt(h.PathID, 10)
 			v := grouped[k]
 			if v.count == 0 {
 				v.day = day
-				v.system = system
-				v.version = version
+				v.systemID = h.SystemID
+				v.pathID = h.PathID
 				if !isReindex {
 					var err error
 					v.count, v.countUnique, err = existingSystemStats(ctx, tx,
-						h.Site, day, v.system, v.version)
+						h.Site, day, h.SystemID, v.pathID)
 					if err != nil {
 						return err
 					}
@@ -60,10 +58,10 @@ func updateSystemStats(ctx context.Context, hits []goatcounter.Hit, isReindex bo
 		}
 
 		siteID := goatcounter.MustGetSite(ctx).ID
-		ins := bulk.NewInsert(ctx, "system_stats", []string{"site", "day",
-			"system", "version", "count", "count_unique"})
+		ins := bulk.NewInsert(ctx, "system_stats", []string{"site_id", "day",
+			"path_id", "system_id", "count", "count_unique"})
 		for _, v := range grouped {
-			ins.Values(siteID, v.day, v.system, v.version, v.count, v.countUnique)
+			ins.Values(siteID, v.day, v.pathID, v.systemID, v.count, v.countUnique)
 		}
 		return ins.Finish()
 	})
@@ -71,7 +69,8 @@ func updateSystemStats(ctx context.Context, hits []goatcounter.Hit, isReindex bo
 
 func existingSystemStats(
 	txctx context.Context, tx zdb.DB, siteID int64,
-	day, system, version string,
+	day string, systemID int64,
+	pathID int64,
 ) (int, int, error) {
 
 	var c []struct {
@@ -80,8 +79,8 @@ func existingSystemStats(
 	}
 	err := tx.SelectContext(txctx, &c, `/* existingSystemStats */
 		select count, count_unique from system_stats
-		where site=$1 and day=$2 and system=$3 and version=$4 limit 1`,
-		siteID, day, system, version)
+		where site_id=$1 and day=$2 and system_id=$3 and path_id=$4 limit 1`,
+		siteID, day, systemID, pathID)
 	if err != nil {
 		return 0, 0, errors.Wrap(err, "select")
 	}
@@ -90,12 +89,7 @@ func existingSystemStats(
 	}
 
 	_, err = tx.ExecContext(txctx, `delete from system_stats where
-		site=$1 and day=$2 and system=$3 and version=$4`,
-		siteID, day, system, version)
+		site_id=$1 and day=$2 and system_id=$3 and path_id=$4`,
+		siteID, day, systemID, pathID)
 	return c[0].Count, c[0].CountUnique, errors.Wrap(err, "delete")
-}
-
-func getSystem(uaHeader string) (string, string) {
-	ua := gadget.Parse(uaHeader)
-	return ua.OSName, ua.OSVersion
 }

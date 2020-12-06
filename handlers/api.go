@@ -407,21 +407,21 @@ func (h api) count(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		hit := goatcounter.Hit{
-			Path:       a.Path,
-			Title:      a.Title,
-			Ref:        a.Ref,
-			Event:      a.Event,
-			Size:       a.Size,
-			Query:      a.Query,
-			Bot:        a.Bot,
-			CreatedAt:  a.CreatedAt,
-			Browser:    a.UserAgent,
-			Location:   a.Location,
-			RemoteAddr: a.IP,
+			Path:            a.Path,
+			Title:           a.Title,
+			Ref:             a.Ref,
+			Event:           a.Event,
+			Size:            a.Size,
+			Query:           a.Query,
+			Bot:             a.Bot,
+			CreatedAt:       a.CreatedAt,
+			UserAgentHeader: a.UserAgent,
+			Location:        a.Location,
+			RemoteAddr:      a.IP,
 		}
 
 		switch {
-		case hit.Browser != "" && a.IP != "":
+		case hit.UserAgentHeader != "" && a.IP != "":
 			// Handle as usual in memstore.
 		case a.Session != "":
 			hit.UserSessionID = a.Session
@@ -431,7 +431,7 @@ func (h api) count(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		hit.Defaults(r.Context())
-		err = hit.Validate(r.Context())
+		err = hit.Validate(r.Context(), true)
 		if err != nil {
 			errs[i] = err.Error()
 			continue

@@ -702,6 +702,352 @@ commit;
 	insert into version values('2020-08-24-1-iso_unique');
 commit;
 `),
+	"db/migrate/pgsql/2020-08-28-1-paths-tables.sql": []byte(`begin;
+	----------------
+	-- NEW TABLES --
+	----------------
+	create table paths (
+		path_id        serial         primary key,
+		site_id        integer        not null,
+		path           varchar        not null,
+		title          varchar        not null default '',
+		event          int            default 0
+	);
+
+	create table user_agents (
+		user_agent_id    serial         primary key,
+		browser_id       int            not null,
+		system_id        int			not null,
+
+		ua               varchar        not null,
+		bot              int            not null
+	);
+
+	create table systems (
+		system_id        serial         primary key,
+		name             varchar,
+		version          varchar
+	);
+
+	create table browsers (
+		browser_id       serial         primary key,
+		name             varchar,
+		version          varchar
+	);
+
+	-- Disable WAL; will be re-enabled later.
+	alter table paths       set unlogged;
+	alter table user_agents set unlogged;
+
+	------------------------
+	-- Copy over the data --
+	------------------------
+	insert into paths (site_id, path, title, event)
+		select
+			site,
+			min(path),
+            (array_agg(title))[array_upper(array_agg(title), 1)],
+			max(event)
+		from hits
+		group by site, lower(path);
+	alter table paths
+		add constraint paths_site_id_fkey
+		foreign key (site_id) references sites(id) on delete restrict on update restrict;
+	create unique index "paths#site_id#path" on paths(site_id, lower(path));
+	create        index "paths#path#title"   on paths(lower(path), lower(title));
+
+	insert into user_agents (ua, bot, browser_id, system_id)
+		select browser, max(bot), 0, 0 from hits group by browser;
+	update user_agents set bot=0 where bot not in (0, 3, 4, 5, 6, 7); -- Others are "not a bot" or because of IP ranges.
+	create unique index "user_agents#ua" on user_agents(ua);
+
+	-- Truncate the data; will be re-created on reindex later.
+	truncate browser_stats;
+	truncate hit_counts;
+	truncate hit_stats;
+	truncate location_stats;
+	truncate ref_counts;
+	truncate system_stats;
+	truncate size_stats;
+
+	---------------------
+	-- Add new columns --
+	---------------------
+	alter table hits          add column path_id       int default 0 not null; -- TODO: is default removed?
+	alter table hits          add column user_agent_id int default 0 not null;
+	alter table hit_stats     add column path_id       int not null;
+	alter table hit_counts    add column path_id       int not null;
+	alter table ref_counts    add column path_id       int not null;
+	alter table browser_stats add column browser_id    int not null;
+	alter table system_stats  add column system_id     int not null;
+
+	-- Set table to be logged again
+    alter table paths       set logged;
+	alter table user_agents set logged;
+
+	insert into version values('2020-08-28-1-paths-tables');
+commit;
+`),
+	"db/migrate/pgsql/2020-08-28-2-paths-paths.sql": []byte(`begin;
+	alter table hits set unlogged;
+
+	create index tmp1 on hits(browser);
+	create index tmp2 on paths(site_id, lower(path));
+
+	update hits set
+		path_id=(select path_id from paths where paths.site_id=hits.site and lower(paths.path)=lower(hits.path)),
+		user_agent_id=(select user_agent_id from user_agents where ua=hits.browser);
+
+	drop index tmp1;
+	drop index tmp2;
+
+	update hits set
+		session2=cast(rpad(cast(session as varchar), 16, '0') as bytea)
+		where session is not null;
+
+	alter table hits set logged;
+
+	insert into version values('2020-08-28-2-paths-paths');
+commit;
+`),
+	"db/migrate/pgsql/2020-08-28-3-paths-rmold.sql": []byte(`begin;
+	------------------------
+	-- Rename/add columns --
+	------------------------
+	alter table sites rename id to site_id;
+	alter table sites add column first_hit_at timestamp;
+	update sites set first_hit_at=created_at;
+	alter table sites alter column first_hit_at set not null;
+	alter table sites drop constraint sites_parent_check;
+	alter sequence sites_id_seq rename to sites_site_id_seq;
+
+	alter table users rename id   to user_id;
+	alter table users rename site to site_id;
+	alter table users drop constraint users_site_check;
+	alter sequence users_id_seq rename to users_user_id_seq;
+	alter index "users#site" rename to "users#site_id";
+	alter index "users#site#email" rename to "users#site_id#email";
+	alter table users rename constraint users_site_fkey to users_site_id_fkey;
+
+	alter table hits rename id       to hit_id;
+	alter table hits rename site     to site_id;
+	alter table hits add check(path_id > 0);
+	alter table hits add check(user_agent_id > 0);
+	alter table hits drop column session;
+	alter table hits rename session2 to session;
+	alter table hits rename constraint hits_site_check to hits_site_id_check;
+	alter sequence hits_id_seq rename to hits_hit_id_seq;
+
+	alter table hit_counts rename site to site_id;
+	alter table hit_counts add foreign key (site_id) references sites(site_id) on delete restrict on update restrict;
+	alter table hit_counts add foreign key (path_id) references paths(path_id) on delete restrict on update restrict;
+	alter table hit_counts drop constraint hit_counts_site_check;
+
+	alter table ref_counts rename site to site_id;
+	alter table ref_counts add foreign key (site_id) references sites(site_id) on delete restrict on update restrict;
+	alter table ref_counts add foreign key (path_id) references paths(path_id) on delete restrict on update restrict;
+	alter table ref_counts drop constraint ref_counts_site_check;
+
+	alter table hit_stats  rename site to site_id;
+	alter table hit_stats drop constraint hit_stats_site_check;
+	alter table hit_stats add foreign key (path_id) references paths(path_id) on delete restrict on update restrict;
+	alter table hit_stats rename constraint hit_stats_site_fkey to hit_stats_site_id_fkey;
+
+	alter table browser_stats rename site to site_id;
+	alter table browser_stats add column path_id int not null;
+	alter table browser_stats drop constraint browser_stats_site_check;
+	alter table browser_stats add foreign key (path_id) references paths(path_id) on delete restrict on update restrict;
+	alter table browser_stats add foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict;
+	alter table browser_stats rename constraint browser_stats_site_fkey to browser_stats_site_id_fkey;
+
+	alter table system_stats rename site to site_id;
+	alter table system_stats drop constraint system_stats_site_check;
+	alter table system_stats add column path_id int not null;
+	alter table system_stats add foreign key (path_id) references paths(path_id) on delete restrict on update restrict;
+	alter table system_stats add foreign key (system_id) references systems(system_id) on delete restrict on update restrict;
+	alter table system_stats rename constraint system_stats_site_fkey to system_stats_site_id_fkey;
+	drop index "system_stats#site#day";
+
+	alter table location_stats rename site to site_id;
+	alter table location_stats drop constraint location_stats_site_check;
+	alter table location_stats add column path_id int not null;
+	alter table location_stats add foreign key (path_id) references paths(path_id) on delete restrict on update restrict;
+	alter table location_stats rename constraint location_stats_site_fkey to location_stats_site_id_fkey;
+
+	alter table size_stats rename site to site_id;
+	alter table size_stats drop constraint size_stats_site_check;
+	alter table size_stats add column path_id int not null;
+	alter table size_stats add foreign key (path_id) references paths(path_id) on delete restrict on update restrict;
+	alter table size_stats rename constraint size_stats_site_fkey to size_stats_site_id_fkey;
+
+
+	--------------------------------------
+	-- Make new indexes and constraints --
+	--------------------------------------
+	create index "sites#parent" on sites(parent) where state='a';
+
+	drop index "hits#site#bot#created_at";
+	create index "hits#site_id#created_at" on hits(site_id, created_at desc);
+	cluster hits using "hits#site_id#created_at";
+
+	-- hit_counts
+	alter table hit_counts add constraint "hit_counts#site_id#path_id#hour" unique(site_id, path_id, hour);
+	alter table hit_counts replica identity using index "hit_counts#site_id#path_id#hour";
+	drop index "hit_counts#site#hour";
+	create index "hit_counts#site_id#hour" on hit_counts(site_id, hour desc);
+	cluster hit_counts using "hit_counts#site_id#hour";
+
+
+	-- ref_counts
+	alter table ref_counts add constraint "ref_counts#site_id#path_id#ref#hour" unique(site_id, path_id, ref, hour);
+	alter table ref_counts replica identity using index "ref_counts#site_id#path_id#ref#hour";
+	drop index "ref_counts#site#hour";
+	create index "ref_counts#site_id#hour" on ref_counts(site_id, hour desc);
+	cluster ref_counts using "ref_counts#site_id#hour";
+
+
+	-- hit_stats
+	create unique index "hit_stats#site_id#path_id#day" on hit_stats(site_id, path_id, day desc);
+	alter table hit_stats replica identity using index "hit_stats#site_id#path_id#day";
+
+	drop index "hit_stats#site#day";
+	create index "hit_stats#site_id#day" on hit_stats(site_id, day desc);
+	cluster hit_stats using "hit_stats#site_id#day";
+
+
+	-- browser_stats
+	create unique index "browser_stats#site_id#path_id#day#browser_id" on browser_stats(site_id, path_id, day, browser_id);
+	alter table browser_stats replica identity using index "browser_stats#site_id#path_id#day#browser_id";
+
+	create index "browser_stats#site_id#browser_id#day" on browser_stats(site_id, browser_id, day desc);
+	cluster browser_stats using "browser_stats#site_id#path_id#day#browser_id";
+
+	-- system_stats
+	create unique index "system_stats#site_id#path_id#day#system_id" on system_stats(site_id, path_id, day, system_id);
+	alter table system_stats replica identity using index "system_stats#site_id#path_id#day#system_id";
+
+	create index "system_stats#site_id#system_id#day" on system_stats(site_id, system_id, day desc);
+	cluster system_stats using "system_stats#site_id#path_id#day#system_id";
+
+	-- location_stats
+	create unique index "location_stats#site_id#path_id#day#location" on location_stats(site_id, path_id, day, location);
+	alter table location_stats replica identity using index "location_stats#site_id#path_id#day#location";
+
+	drop index "location_stats#site#day#location";
+    create index "location_stats#site_id#day" on location_stats(site_id, day desc);
+	cluster location_stats using "location_stats#site_id#day";
+
+	-- size_stats
+	create unique index "size_stats#site_id#path_id#day#width" on size_stats(site_id, path_id, day, width);
+	alter table size_stats replica identity using index "size_stats#site_id#path_id#day#width";
+
+	drop index "size_stats#site#day#width";
+    create index "size_stats#site_id#day" on size_stats(site_id, day desc);
+	cluster size_stats using "size_stats#site_id#day";
+
+	alter table store replica identity using index "store#key";
+
+	------------------------
+	-- Remove old columns --
+	------------------------
+	alter table hits drop column path;
+	alter table hits drop column title;
+	alter table hits drop column event;
+	alter table hits drop column browser;
+
+	alter table hit_stats  drop column path;
+	alter table hit_stats  drop column title;
+
+	alter table hit_counts drop column path;
+	alter table hit_counts drop column title;
+	alter table hit_counts drop column event;
+
+	alter table ref_counts drop column path;
+
+	alter table browser_stats drop column browser;
+	alter table browser_stats drop column version;
+
+	alter table system_stats  drop column system;
+	alter table system_stats  drop column version;
+
+	insert into version values('2020-08-28-3-paths-rmold');
+commit;
+`),
+	"db/migrate/pgsql/2020-08-28-5-paths-ua-fk.sql": []byte(`begin;
+	alter table user_agents add foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict;
+	alter table user_agents add foreign key (system_id)  references systems(system_id)   on delete restrict on update restrict;
+
+	alter table hits alter column path_id drop default;
+	alter table hits alter column user_agent_id drop default;
+
+	insert into version values('2020-08-28-5-paths-ua-fk');
+commit;
+`),
+	"db/migrate/pgsql/2020-08-28-6-paths-views.sql": []byte(`begin;
+	create view view_user_agents as
+		select
+			user_agents.user_agent_id as id,
+			user_agents.system_id     as bid,
+			user_agents.browser_id    as sid,
+			user_agents.bot,
+			browsers.name || ' ' || browsers.version as browser,
+			systems.name  || ' ' || systems.version as system,
+			user_agents.ua
+		from user_agents
+		join browsers using (browser_id)
+		join systems using (system_id);
+
+	create view hits_export as
+		select
+			hits.hit_id,
+			hits.site_id,
+
+			paths.path,
+			paths.title,
+			paths.event,
+
+			user_agents.ua,
+			browsers.name || ' ' || browsers.version as browser,
+			systems.name || ' ' || systems.version as system,
+
+			hits.session,
+			hits.bot,
+			hits.ref,
+			hits.ref_scheme as ref_s,
+			hits.size,
+			hits.location as loc,
+			hits.first_visit as first,
+			hits.created_at
+		from hits
+		join paths       using (site_id, path_id)
+		join user_agents using (user_agent_id)
+		join browsers    using (browser_id)
+		join systems     using (system_id)
+		order by hit_id asc;
+
+	insert into version values ('2020-08-28-6-paths-views');
+commit;
+`),
+	"db/migrate/pgsql/2020-08-28-7-refs.sql": []byte(`begin;
+	-- Correct some data while we're at it.
+	update hits set path = regexp_replace(path, '\?__cf_chl_captcha_tk__=.*?(&|$)', '')
+		where path like '%?__cf_chl_captcha_tk__=%';
+
+	update hits set path = regexp_replace(path, '\?__cf_chl_jschl_tk__=.*?(&|$)', '')
+		where path like '%?__cf_chl_jschl_tk__=%';
+
+	update hits set ref='Baidu', ref_scheme='g' where
+		ref like 'baidu.com/%' or
+		ref like 'c.tieba.baidu.com/%' or
+		ref like 'm.baidu.com/%' or
+		ref like 'tieba.baidu.com/%' or
+		ref like 'www.baidu.com/%';
+
+	update hits set ref='Yahoo', ref_scheme='g' where ref like '%search.yahoo.com%';
+
+	insert into versions values('2020-08-28-7-refs');
+commit;
+`),
 }
 
 var MigrationsSQLite = map[string][]byte{
@@ -1604,6 +1950,495 @@ commit;
 
 
 	insert into version values('2020-08-24-1-iso_unique');
+commit;
+`),
+	"db/migrate/sqlite/2020-08-28-1-paths-tables.sql": []byte(`begin;
+	----------------
+	-- NEW TABLES --
+	----------------
+	create table paths (
+		path_id        integer        primary key autoincrement,
+		site_id        integer        not null,
+		path           varchar        not null,
+		title          varchar        not null default '',
+		event          int            default 0,
+
+		foreign key (site_id) references sites(id) on delete restrict on update restrict
+	);
+
+	create table user_agents (
+		user_agent_id    integer        primary key autoincrement,
+		browser_id       integer        not null,
+		system_id        integer        not null,
+
+		ua               varchar        not null,
+		bot              integer        not null
+	);
+
+	create table systems (
+		system_id        integer        primary key autoincrement,
+		name             varchar,
+		version          varchar
+	);
+
+	create table browsers (
+		browser_id       integer        primary key autoincrement,
+		name             varchar,
+		version          varchar
+	);
+
+	------------------------
+	-- Copy over the data --
+	------------------------
+	insert into paths (site_id, path, title, event)
+		select
+			site,
+			min(path),
+            max(title),
+			max(event)
+		from hits
+		group by site, lower(path);
+	create unique index "paths#site_id#path" on paths(site_id, lower(path));
+	create        index "paths#path#title"   on paths(lower(path), lower(title));
+
+	insert into user_agents (ua, bot, browser_id, system_id)
+		select browser, max(bot), 0, 0 from hits group by browser;
+	update user_agents set bot=0 where bot not in (0, 3, 4, 5, 6, 7); -- Others are "not a bot" or because of IP ranges.
+	create unique index "user_agents#ua" on user_agents(ua);
+
+	-- Truncate the data; will be re-created on reindex later.
+	delete from browser_stats;
+	delete from hit_counts;
+	delete from hit_stats;
+	delete from location_stats;
+	delete from ref_counts;
+	delete from system_stats;
+	delete from size_stats;
+
+	---------------------
+	-- Add new columns --
+	---------------------
+	alter table hits          add column path_id       int default 0 not null;
+	alter table hits          add column user_agent_id int default 0 not null;
+	alter table hit_stats     add column path_id       int not null;
+	alter table hit_counts    add column path_id       int not null;
+	alter table ref_counts    add column path_id       int not null;
+	alter table browser_stats add column browser_id    int not null;
+	alter table system_stats  add column system_id     int not null;
+
+	insert into version values('2020-08-28-1-paths-tables');
+commit;
+`),
+	"db/migrate/sqlite/2020-08-28-2-paths-paths.sql": []byte(`begin;
+	create index tmp1 on hits(browser);
+	create index tmp2 on paths(site_id, lower(path));
+
+	update hits set
+		path_id=(select path_id from paths where paths.site_id=hits.site and paths.path=hits.path),
+		user_agent_id=(select user_agent_id from user_agents where ua=hits.browser);
+
+	drop index tmp1;
+	drop index tmp2;
+
+	update hits set
+		session2=cast(substr(session || '0000000000000000' , 1, 16) as blob)
+		where session is not null;
+
+	insert into version values('2020-08-28-2-paths-paths');
+commit;
+`),
+	"db/migrate/sqlite/2020-08-28-3-paths-rmold.sql": []byte(`-- FKs are fine, but it still gives errors with this (even when defer is on).
+-- After export & import it's fine 🤷
+pragma foreign_keys = off;
+begin;
+	-- alter table sites rename id to site_id;
+	-- alter table sites add column first_hit_at timestamp;
+	-- alter table sites drop constraint sites_parent_check;
+	create table sites2 (
+		site_id        integer        primary key autoincrement,
+		parent         integer        null,
+
+		code           varchar        not null                 check(length(code) >= 2   and length(code) <= 50),
+		link_domain    varchar        not null default ''      check(link_domain = '' or (length(link_domain) >= 4 and length(link_domain) <= 255)),
+		cname          varchar        null                     check(cname is null or (length(cname) >= 4 and length(cname) <= 255)),
+		cname_setup_at timestamp      default null             check(cname_setup_at = strftime('%Y-%m-%d %H:%M:%S', cname_setup_at)),
+		plan           varchar        not null                 check(plan in ('personal', 'personalplus', 'business', 'businessplus', 'child', 'custom')),
+		stripe         varchar        null,
+		billing_amount varchar,
+		settings       varchar        not null,
+		received_data  integer        not null default 0,
+
+		state          varchar        not null default 'a'     check(state in ('a', 'd')),
+		created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
+		updated_at     timestamp                               check(updated_at = strftime('%Y-%m-%d %H:%M:%S', updated_at)),
+		first_hit_at   timestamp      not null                 check(first_hit_at = strftime('%Y-%m-%d %H:%M:%S', first_hit_at))
+	);
+	insert into sites2
+		select id, parent, code, link_domain, cname, cname_setup_at, plan, stripe, billing_amount,
+			settings, received_data, state, created_at, updated_at, created_at from sites;
+	drop table sites;
+	alter table sites2 rename to sites;
+	create unique index "sites#code" on sites(lower(code));
+	create index "sites#parent" on sites(parent) where state='a';
+	create unique index if not exists "sites#cname" on sites(lower(cname));
+
+
+	-- alter table users rename id   to user_id;
+	-- alter table users rename site to site_id;
+	-- alter table users drop constraint users_site_id_check;
+	create table users2 (
+		user_id        integer        primary key autoincrement,
+		site_id        integer        not null,
+
+		email          varchar        not null                 check(length(email) > 5 and length(email) <= 255),
+		email_verified integer        not null default 0,
+		password       blob           default null,
+		totp_enabled   integer        not null default 0,
+		totp_secret    blob,
+		role           varchar        not null default ''      check(role in ('', 'a')),
+		login_at       timestamp      null                     check(login_at = strftime('%Y-%m-%d %H:%M:%S', login_at)),
+		login_request  varchar        null,
+		login_token    varchar        null,
+		csrf_token     varchar        null,
+		email_token    varchar        null,
+		seen_updates_at timestamp     not null default current_timestamp check(seen_updates_at = strftime('%Y-%m-%d %H:%M:%S', seen_updates_at)),
+		reset_at       timestamp      null,
+
+		created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
+		updated_at     timestamp                               check(updated_at = strftime('%Y-%m-%d %H:%M:%S', updated_at)),
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict
+	);
+	insert into users2
+		select id, site, email, email_verified, password, totp_enabled, totp_secret, role, login_at, login_request,
+			login_token, csrf_token, email_token, seen_updates_at, reset_at, created_at, updated_at from users;
+	drop table users;
+	alter table users2 rename to users;
+	create        index "users#site_id"       on users(site_id);
+	create unique index "users#site_id#email" on users(site_id, lower(email));
+
+	-- alter table hits rename id to hit_id;
+	-- alter table hits rename site to site_id;
+	-- alter table hits drop column session;
+	-- alter table hits rename session2 to session;
+	-- alter table hits drop column path;
+	-- alter table hits drop column title;
+	-- alter table hits drop column event;
+	-- alter table hits drop column browser;
+	-- alter table hits add check(path_id > 0);
+	-- alter table hits add check(user_agent_id > 0);
+	create table hits2 (
+		hit_id         integer        primary key autoincrement,
+		site_id        integer        not null                 check(site_id > 0),
+		path_id        integer        not null                 check(path_id > 0),
+		user_agent_id  integer        not null                 check(user_agent_id > 0),
+
+		session        blob           default null,
+		bot            integer        default 0,
+		ref            varchar        not null,
+		ref_scheme     varchar        null                     check(ref_scheme in ('h', 'g', 'o', 'c')),
+		size           varchar        not null default '',
+		location       varchar        not null default '',
+		first_visit    integer        default 0,
+
+		created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at))
+	);
+	insert into hits2
+		select id, site, path_id, user_agent_id, session2, bot, ref, ref_scheme, size, location, first_visit, created_at from hits;
+	drop table hits;
+	alter table hits2 rename to hits;
+	create index "hits#site_id#created_at" on hits(site_id, created_at);
+
+
+	-- alter table hit_counts rename site to site_id;
+	-- alter table hit_counts drop column path;
+	-- alter table hit_counts drop column title;
+	-- alter table hit_counts drop column event;
+	-- alter table hit_counts add foreign key (site_id) references sites(site_id) on delete restrict on update restrict;
+	drop table hit_counts;
+	create table hit_counts (
+		site_id       integer    not null,
+		path_id       integer    not null,
+
+		hour          timestamp  not null check(hour = strftime('%Y-%m-%d %H:%M:%S', hour)),
+		total         integer    not null,
+		total_unique  integer    not null,
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+		foreign key (path_id) references paths(path_id) on delete restrict on update restrict,
+		constraint "hit_counts#site_id#path_id#hour" unique(site_id, path_id, hour) on conflict replace
+	);
+	create index "hit_counts#site_id#hour" on hit_counts(site_id, hour);
+
+
+	-- alter table ref_counts     rename site to site_id;
+	-- alter table ref_counts drop column path;
+	-- alter table ref_counts add foreign key (site_id) references sites(site_id) on delete restrict on update restrict;
+	drop table ref_counts;
+	create table ref_counts (
+		site_id       integer    not null,
+		path_id       integer    not null,
+
+		ref           varchar    not null,
+		ref_scheme    varchar    null,
+		hour          timestamp  not null check(hour=strftime('%Y-%m-%d %H:%M:%S', hour)),
+		total         integer    not null,
+		total_unique  integer    not null,
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+		foreign key (path_id) references paths(path_id) on delete restrict on update restrict,
+		constraint "ref_counts#site_id#path_id#ref#hour" unique(site_id, path_id, ref, hour) on conflict replace
+	);
+	create index "ref_counts#site_id#hour" on ref_counts(site_id, hour);
+
+
+	-- alter table hit_stats rename site to site_id;
+	-- alter table hit_stats drop column path;
+	-- alter table hit_stats drop column title;
+	-- alter table hit_stats drop constraint hit_stats_site_id_check;
+	drop table hit_stats;
+	create table hit_stats (
+		site_id        integer        not null,
+		path_id        integer        not null,
+
+		day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
+		stats          varchar        not null,
+		stats_unique   varchar        not null,
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+		foreign key (path_id) references paths(path_id) on delete restrict on update restrict
+	);
+ 	create unique index "hit_stats#site_id#path_id#day" on hit_stats(site_id, path_id, day);
+	create        index "hit_stats#site_id#day"         on hit_stats(site_id, day);
+
+
+	-- alter table browser_stats rename site to site_id;
+	-- alter table browser_stats drop column browser;
+	-- alter table browser_stats drop column version;
+	drop table browser_stats;
+	create table browser_stats (
+		site_id        integer        not null,
+		path_id        integer        not null,
+		browser_id     integer        not null,
+
+		day            date           not null                 check(day=strftime('%Y-%m-%d', day)),
+		count          integer        not null,
+		count_unique   integer        not null,
+
+		foreign key (site_id)    references sites(site_id)       on delete restrict on update restrict,
+		foreign key (path_id)    references paths(path_id)       on delete restrict on update restrict,
+		foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict
+	);
+	create unique index "browser_stats#site_id#path_id#day#browser_id" on browser_stats(site_id, path_id, day, browser_id);
+	create index "browser_stats#site_id#browser_id#day" on browser_stats(site_id, browser_id, day);
+
+
+	-- alter table system_stats rename site to site_id;
+	-- alter table system_stats drop column system;
+	-- alter table system_stats drop column version;
+	drop table system_stats;
+	create table system_stats (
+		site_id        integer        not null,
+		path_id        integer        not null,
+		system_id      integer        not null,
+
+		day            date           not null                 check(day=strftime('%Y-%m-%d', day)),
+		count          integer        not null,
+		count_unique   integer        not null,
+
+		foreign key (site_id)   references sites(site_id)     on delete restrict on update restrict,
+		foreign key (path_id)   references paths(path_id)     on delete restrict on update restrict,
+		foreign key (system_id) references systems(system_id) on delete restrict on update restrict
+	);
+	create unique index "system_stats#site_id#path_id#day#system_id" on system_stats(site_id, path_id, day, system_id);
+	create index "system_stats#site_id#system_id#day" on system_stats(site_id, system_id, day);
+
+
+	-- alter table location_stats rename site to site_id;
+	drop table location_stats;
+	create table location_stats (
+		site_id        integer        not null,
+		path_id        integer        not null,
+
+		day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
+		location       varchar        not null,
+		count          integer        not null,
+		count_unique   integer        not null,
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+		foreign key (path_id) references paths(path_id) on delete restrict on update restrict
+	);
+	create unique index "location_stats#site_id#path_id#day#location" on location_stats(site_id, path_id, day, location);
+    create index "location_stats#site_id#day" on location_stats(site_id, day);
+
+
+	-- alter table size_stats rename site to site_id;
+	drop table size_stats;
+	create table size_stats (
+		site_id        integer        not null,
+		path_id        integer        not null,
+
+		day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
+		width          integer        not null,
+		count          integer        not null,
+		count_unique   integer        not null,
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+		foreign key (path_id) references paths(path_id) on delete restrict on update restrict
+	);
+	create unique index "size_stats#site_id#path_id#day#width" on size_stats(site_id, path_id, day, width);
+    create index "size_stats#site_id#day" on size_stats(site_id, day);
+
+
+	-- Need to rename to FK on the following tables.
+
+	create table api_tokens2 (
+		api_token_id   integer        primary key autoincrement,
+		site_id        integer        not null,
+		user_id        integer        not null,
+
+		name           varchar        not null,
+		token          varchar        not null                 check(length(token) > 10),
+		permissions    varchar        not null,
+		created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+		foreign key (user_id) references users(user_id) on delete restrict on update restrict
+	);
+	insert into api_tokens2
+		select api_token_id, site_id, user_id, name, token, permissions, created_at from api_tokens;
+	drop table api_tokens;
+	alter table api_tokens2 rename to api_tokens;
+	create unique index "api_tokens#site_id#token" on api_tokens(site_id, token);
+
+	CREATE TABLE exports2 (
+		export_id         integer        primary key autoincrement,
+		site_id           integer        not null,
+		start_from_hit_id integer        not null,
+
+		path              varchar        not null,
+		created_at        timestamp      not null    check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
+
+		finished_at       timestamp                  check(finished_at is null or finished_at = strftime('%Y-%m-%d %H:%M:%S', finished_at)),
+		last_hit_id       integer,
+		num_rows          integer,
+		size              varchar,
+		hash              varchar,
+		error             varchar,
+
+		foreign key (site_id) references sites(site_id) on delete restrict on update restrict
+	);
+	insert into exports2
+		select export_id, site_id, start_from_hit_id, path, created_at, finished_at, last_hit_id, num_rows, size, hash, error from exports;
+	drop table exports;
+	alter table exports2 rename to exports;
+	create index "exports#site_id#created_at" on exports(site_id, created_at);
+
+
+	CREATE TABLE paths2 (
+			path_id        integer        primary key autoincrement,
+			site_id        integer        not null,
+			path           varchar        not null,
+			title          varchar        not null default '',
+			event          int            default 0,
+
+			foreign key (site_id) references sites(site_id) on delete restrict on update restrict
+		);
+	insert into paths2
+		select path_id, site_id, path, title, event from paths;
+	drop table paths;
+	alter table paths2 rename to paths;
+	create unique index "paths#site_id#path" on paths(site_id, lower(path));
+	create        index "paths#path#title"   on paths(lower(path), lower(title));
+
+ 	insert into version values('2020-08-28-3-paths-rmold');
+commit;
+`),
+	"db/migrate/sqlite/2020-08-28-5-paths-ua-fk.sql": []byte(`begin;
+	create table user_agents2 (
+		user_agent_id    integer        primary key autoincrement,
+		browser_id       int            not null,
+		system_id        int			not null,
+
+		ua               varchar        not null,
+		bot              int            not null,
+
+		foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict,
+		foreign key (system_id)  references systems(system_id)   on delete restrict on update restrict
+	);
+
+	insert into user_agents2
+		select user_agent_id, browser_id, system_id, ua, bot from user_agents;
+	drop table user_agents;
+	alter table user_agents2 rename to user_agents;
+	create unique index "user_agents#ua" on user_agents(ua);
+
+	insert into version values('2020-08-28-5-paths-ua-fk');
+commit;
+`),
+	"db/migrate/sqlite/2020-08-28-6-paths-views.sql": []byte(`begin;
+	create view view_user_agents as
+		select
+			user_agents.user_agent_id as id,
+			user_agents.system_id as bid,
+			user_agents.browser_id as sid,
+			user_agents.bot,
+			browsers.name || ' ' || browsers.version as browser,
+			systems.name  || ' ' || systems.version as system,
+			user_agents.ua
+		from user_agents
+		join browsers using (browser_id)
+		join systems using (system_id);
+
+	create view hits_export as
+		select
+			hits.hit_id,
+			hits.site_id,
+
+			paths.path,
+			paths.title,
+			paths.event,
+
+			user_agents.ua,
+			browsers.name || ' ' || browsers.version as browser,
+			systems.name || ' ' || systems.version as system,
+
+			hits.session,
+			hits.bot,
+			hits.ref,
+			hits.ref_scheme as ref_s,
+			hits.size,
+			hits.location as loc,
+			hits.first_visit as first,
+			hits.created_at
+		from hits
+		join paths       using (site_id, path_id)
+		join user_agents using (user_agent_id)
+		join browsers    using (browser_id)
+		join systems     using (system_id)
+		order by hit_id asc;
+
+	insert into version values ('2020-08-28-6-paths-views');
+commit;
+`),
+	"db/migrate/sqlite/2020-08-28-7-refs.sql": []byte(`begin;
+	-- Correct some data while we're at it.
+	update hits set path = regexp_replace(path, '\?__cf_chl_captcha_tk__=.*?(&|$)', '')
+		where path like '%?__cf_chl_captcha_tk__=%';
+
+	update hits set path = regexp_replace(path, '\?__cf_chl_jschl_tk__=.*?(&|$)', '')
+		where path like '%?__cf_chl_jschl_tk__=%';
+
+	update hits set ref='Baidu', ref_scheme='g' where
+		ref like 'baidu.com/%' or
+		ref like 'c.tieba.baidu.com/%' or
+		ref like 'm.baidu.com/%' or
+		ref like 'tieba.baidu.com/%' or
+		ref like 'www.baidu.com/%';
+
+	update hits set ref='Yahoo', ref_scheme='g' where ref like '%search.yahoo.com%';
+
+	insert into versions values('2020-08-28-7-refs');
 commit;
 `),
 	"db/migrate/sqlite/2020-11-10-1-correct-exports.sql": []byte(`begin;
@@ -11976,31 +12811,35 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 (function() {
 	'use strict';
 
-	var SETTINGS     = {},
-		CSRF         = '',
-		TZ_OFFSET    = 0,
-		SITE_CREATED = 0
+	var SETTINGS          = {},
+		CSRF              = '',
+		TZ_OFFSET         = 0,
+		SITE_FIRST_HIT_AT = 0
 
 	$(document).ready(function() {
-		SETTINGS     = JSON.parse($('#js-settings').text())
-		CSRF         = $('#js-settings').attr('data-csrf')
-		TZ_OFFSET    = parseInt($('#js-settings').attr('data-offset'), 10) || 0
-		SITE_CREATED = $('#js-settings').attr('data-created') * 1000
+		SETTINGS          = JSON.parse($('#js-settings').text())
+		CSRF              = $('#js-settings').attr('data-csrf')
+		TZ_OFFSET         = parseInt($('#js-settings').attr('data-offset'), 10) || 0
+		SITE_FIRST_HIT_AT = $('#js-settings').attr('data-first-hit-at') * 1000
 
-		;[report_errors, period_select, load_refs, tooltip, paginate_pages,
-			hchart_detail, settings_tabs, billing_subscribe, setup_datepicker,
-			filter_pages, add_ip, fill_tz, draw_chart, bind_scale, pgstat,
-			copy_pre, ref_pages,
+		;[report_errors, dashboard, period_select, tooltip, settings_tabs,
+			billing_subscribe, setup_datepicker, filter_pages, add_ip, fill_tz,
+			bind_scale, pgstat, copy_pre,
 		].forEach(function(f) { f.call() })
-	});
+	})
+
+	// Set up all the dashboard widget contents (but not the header).
+	var dashboard = function() {
+		[draw_chart, paginate_pages, load_refs, hchart_detail, ref_pages].forEach(function(f) { f.call() })
+	}
 
 	// Set up error reporting.
 	var report_errors = function() {
-		window.onerror = on_error;
+		window.onerror = on_error
 
 		$(document).on('ajaxError', function(e, xhr, settings, err) {
 			if (settings.url === '/jserr')  // Just in case, otherwise we'll be stuck.
-				return;
+				return
 			var msg = ` + "`" + `Could not load ${settings.url}: ${err}` + "`" + `
 			console.error(msg)
 			on_error(` + "`" + `ajaxError: ${msg}` + "`" + `, settings.url)
@@ -12012,13 +12851,13 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 	var on_error = function(msg, url, line, column, err) {
 		// Don't log useless errors in Safari: https://bugs.webkit.org/show_bug.cgi?id=132945
 		if (msg === 'Script error.' && navigator.vendor && navigator.vendor.indexOf('Apple') > -1)
-			return;
+			return
 
 		jQuery.ajax({
 			url:    '/jserr',
 			method: 'POST',
 			data:    {msg: msg, url: url, line: line, column: column, stack: (err||{}).stack, ua: navigator.userAgent, loc: window.location+''},
-		});
+		})
 	}
 
 	// Load pages for reference in Totals
@@ -12132,7 +12971,7 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 	// Add current IP address to ignore_ips.
 	var add_ip = function() {
 		$('#add-ip').on('click', function(e) {
-			e.preventDefault();
+			e.preventDefault()
 
 			jQuery.ajax({
 				url:     '/ip',
@@ -12140,78 +12979,87 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 					var input   = $('[name="settings.ignore_ips"]'),
 						current = input.val().split(',').
 							map(function(m) { return m.trim() }).
-							filter(function(m) { return m !== '' });
+							filter(function(m) { return m !== '' })
 
 					if (current.indexOf(data) > -1) {
-						$('#add-ip').after('<span class="err">IP ' + data + ' is already in the list</span>');
-						return;
+						$('#add-ip').after('<span class="err">IP ' + data + ' is already in the list</span>')
+						return
 					}
-					current.push(data);
-					var set = current.join(', ');
+					current.push(data)
+					var set = current.join(', ')
 					input.val(set).
 						trigger('focus')[0].
-						setSelectionRange(set.length, set.length);
+						setSelectionRange(set.length, set.length)
 				},
-			});
-		});
-	};
+			})
+		})
+	}
 
 	// Set the timezone based on the browser's timezone.
 	var fill_tz = function() {
 		$('#set-local-tz').on('click', function(e) {
-			e.preventDefault();
+			e.preventDefault()
 
 			if (!window.Intl || !window.Intl.DateTimeFormat) {
-				alert("Sorry, your browser doesn't support accurate timezone information :-(");
-				return;
+				alert("Sorry, your browser doesn't support accurate timezone information :-(")
+				return
 			}
 
-			var zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-			$('#timezone [value$="' + zone + '"]').attr('selected', true);
-		});
-	};
+			var zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+			$('#timezone [value$="' + zone + '"]').attr('selected', true)
+		})
+	}
 
 	// Get the Y-axis scake.
 	var get_original_scale = function(current) { return $('.count-list-pages').attr('data-max') }
 	var get_current_scale  = function(current) { return $('.count-list-pages').attr('data-scale') }
 
-	// Reload the path list when typing in the filter input, so the user won't
+	// Reload the dashboard when typing in the filter input, so the user won't
 	// have to press "enter".
 	var filter_pages = function() {
-		highlight_filter($('#filter-paths').val());
+		highlight_filter($('#filter-paths').val())
 
-		var t;
+		$('#filter-paths').on('keydown', function(e) {
+			if (e.keyCode === 13)  // Don't submit form on enter.
+				e.preventDefault()
+		})
+
+		var t
 		$('#filter-paths').on('input', function(e) {
-			clearTimeout(t);
+			clearTimeout(t)
 			t = setTimeout(function() {
 				var filter = $(e.target).val().trim()
-				push_query('filter', filter)
-				push_query('showrefs', null) // clear as this will be reset
+				push_query({filter: filter, showrefs: null})
 				$('#filter-paths').toggleClass('value', filter !== '')
 
 				var loading = $('<span class="loading"></span>')
 				$(e.target).after(loading)
-				jQuery.ajax({
-					url:     '/pages',
-					data:    append_period({
-						filter: filter,
-						daily:  $('#daily').is(':checked'),
-						max:    get_original_scale(),
-					}),
-					success: function(data) {
-						update_pages(data, true)
-						loading.remove()
-					},
-				});
-			}, 300);
+				// TODO: back button doesn't quite work with this.
+				reload_dashboard(() => loading.remove())
+			}, 300)
 		})
+	}
 
-		// Don't submit form on enter.
-		$('#filter-paths').on('keydown', function(e) {
-			if (e.keyCode === 13)
-				e.preventDefault()
+	// Reload the widgets on the dashboard.
+	var reload_dashboard = function(done) {
+		jQuery.ajax({
+			url:     '/',
+			data:    append_period({
+				daily:     $('#daily').is(':checked'),
+				'as-text': $('#as-text').is(':checked'),
+				max:       get_original_scale(),
+				reload:    't',
+			}),
+			success: function(data) {
+				$('#dash-widgets').html(data.widgets)
+				$('#dash-timerange').html(data.timerange)
+				dashboard()
+				highlight_filter($('#filter-paths').val())
+				if (done)
+					done()
+			},
 		})
-	};
+	}
 
 	// Paginate the main path overview.
 	var paginate_pages = function() {
@@ -12221,68 +13069,43 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 				jQuery.ajax({
 					url:  '/pages',
 					data: append_period({
-						filter:    $('#filter-paths').val(),
 						daily:     $('#daily').is(':checked'),
-						exclude:   $('.count-list-pages >tbody >tr').toArray().map((e) => e.id).join(','),
+						exclude:   $('.count-list-pages >tbody >tr').toArray().map((e) => e.dataset.id).join(','),
 						max:       get_original_scale(),
 						offset:    $('.count-list-pages >tbody >tr').length + 1,
-						'as-text': $('.count-list-text').length > 0,
+						'as-text': $('#as-text').is(':checked'),
 					}),
 					success: function(data) {
-						update_pages(data, false)
+						$('.pages-list .count-list-pages > tbody.pages').append(data.rows)
+						draw_chart()
+
+						highlight_filter($('#filter-paths').val())
+						$('.pages-list >.load-more').css('display', data.more ? 'inline-block' : 'none')
+
+						$('.total-display').each((_, t) => {
+							$(t).text(format_int(parseInt($(t).text().replace(/[^0-9]/, ''), 10) + data.total_display))
+						})
+						$('.total-unique-display').each((_, t) => {
+							$(t).text(format_int(parseInt($(t).text().replace(/[^0-9]/, ''), 10) + data.total_unique_display))
+						})
+
 						done()
 					},
 				})
 			})
 		})
-	};
-
-	// Update the page list from ajax request on pagination/filter.
-	var update_pages = function(data, from_filter) {
-		if (from_filter) {
-			$('.count-list-pages').attr('data-max', data.max)
-			$('.count-list-pages').attr('data-scale', data.max)
-			$('.totals tbody').replaceWith(data.totals)
-			$('.pages-list tbody').html(data.rows)
-		}
-		else
-			$('.pages-list .count-list-pages > tbody.pages').append(data.rows)
-
-		highlight_filter($('#filter-paths').val())
-		$('.pages-list >.load-more').css('display', data.more ? 'inline-block' : 'none')
-
-		var th = $('.total-hits'),
-		    td = $('.total-display'),
-			tu = $('.total-unique'),
-			ud = $('.total-unique-display')
-		if (from_filter) {
-			th.text(format_int(data.total_hits));
-			td.text(format_int(data.total_display));
-			tu.text(format_int(data.total_unique));
-			ud.text(format_int(data.total_unique_display));
-		}
-		else {
-			td.each((_, t) => {
-				$(t).text(format_int(parseInt($(t).text().replace(/[^0-9]/, ''), 10) + data.total_display));
-			})
-			ud.each((_, t) => {
-				$(t).text(format_int(parseInt($(t).text().replace(/[^0-9]/, ''), 10) + data.total_unique_display));
-			})
-		}
-
-		draw_chart()
-	};
+	}
 
 	// Highlight a filter pattern in the path and title.
 	var highlight_filter = function(s) {
 		if (s === '')
-			return;
+			return
 		$('.pages-list .count-list-pages > tbody.pages').find('.rlink, .page-title:not(.no-title)').each(function(_, elem) {
 			if ($(elem).find('b').length)  // Don't apply twice after pagination
 				return
-			elem.innerHTML = elem.innerHTML.replace(new RegExp('' + quote_re(s) + '', 'gi'), '<b>$&</b>');
-		});
-	};
+			elem.innerHTML = elem.innerHTML.replace(new RegExp('' + quote_re(s) + '', 'gi'), '<b>$&</b>')
+		})
+	}
 
 	// Setup datepicker fields.
 	var setup_datepicker = function() {
@@ -12311,33 +13134,33 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 				css('width', 'auto');  // Make sure there's room for UI chrome.
 		}
 
-		var opts = {toString: format_date_ymd, parse: get_date, firstDay: SETTINGS.sunday_starts_week?0:1, minDate: new Date(SITE_CREATED)}
+		var opts = {toString: format_date_ymd, parse: get_date, firstDay: SETTINGS.sunday_starts_week?0:1, minDate: new Date(SITE_FIRST_HIT_AT)}
 		new Pikaday($('#period-start')[0], opts)
 		new Pikaday($('#period-end')[0], opts)
-	};
+	}
 
 	// Subscribe with Stripe.
 	var billing_subscribe = function() {
 		var form = $('#billing-form')
 		if (!form.length)
-			return;
+			return
 
 		// Show/hide donation options.
 		$('.plan input, .free input').on('change', function() {
 			var personal = $('input[name="plan"]:checked').val() === 'personal',
-				quantity = parseInt($('#quantity').val(), 10);
+				quantity = parseInt($('#quantity').val(), 10)
 
-			$('.free').css('display', personal ? 'block' : 'none');
-			$('.ask-cc').css('display', personal && quantity === 0 ? 'none' : 'block');
-		}).trigger('change');
+			$('.free').css('display', personal ? 'block' : 'none')
+			$('.ask-cc').css('display', personal && quantity === 0 ? 'none' : 'block')
+		}).trigger('change')
 
 		form.on('submit', function(e) {
-			e.preventDefault();
+			e.preventDefault()
 
 			if (typeof(Stripe) === 'undefined') {
 				alert('Stripe JavaScript failed to load from "https://js.stripe.com/v3"; ' +
-					'ensure this domain is allowed to load JavaScript and reload the page to try again.');
-				return;
+					'ensure this domain is allowed to load JavaScript and reload the page to try again.')
+				return
 			}
 
 			form.find('button').attr('disabled', true).text('Redirecting...');
@@ -12522,12 +13345,13 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 
 			if (start > (new Date()).getTime())
 				return alert('That would be in the future.')
-			if (SITE_CREATED > end.getTime())
+			if (SITE_FIRST_HIT_AT > end.getTime())
 				return alert('That would be before the site’s creation; GoatCounter is not *that* good ;-)')
 
+			$('#dash-select-period').attr('class', '')
 			set_period(start, end);
 		})
-	};
+	}
 
 	// Load references as an AJAX request.
 	var load_refs = function() {
@@ -12550,10 +13374,10 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 			// that gives a somewhat yanky effect (close, wait on xhr, open).
 			if (init && params['showrefs'] === path) {
 				close()
-				return push_query('showrefs', null)
+				return push_query({showrefs: null})
 			}
 
-			push_query('showrefs', path)
+			push_query({showrefs: path})
 			var done = paginate_button(btn , () => {
 				jQuery.ajax({
 					url:   '/hchart-more',
@@ -12682,7 +13506,7 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 			obj[item[0]] = decodeURIComponent(item[1]);
 		}
 		return obj;
-	};
+	}
 
 	// Join query parameters from {k: v} object to href.
 	var join_query = function(obj) {
@@ -12690,16 +13514,18 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 		for (var k in obj)
 			s.push(k + '=' + encodeURIComponent(obj[k]));
 		return (s.length === 0 ? '/' : ('?' + s.join('&')));
-	};
+	}
 
 	// Set one query parameter – leaving the others alone – and push to history.
-	var push_query = function(k, v) {
-		var params = split_query(location.search);
-		if (v === null)
-			delete params[k];
-		else
-			params[k] = v;
-		history.pushState(null, '', join_query(params));
+	var push_query = function(params) {
+		var current = split_query(location.search)
+		for (var k in params) {
+			if (params[k] === null)
+				delete current[k]
+			else
+				current[k] = params[k]
+		}
+		history.pushState(null, '', join_query(current))
 	}
 
 	// Convert "23:45" to "11:45 pm".
@@ -12714,11 +13540,10 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 			return t + ' pm';
 		else
 			return (hour - 12) + t.substr(2) + ' pm';
-	};
+	}
 
-	var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
-		          "Sep", "Oct", "Nov", "Dec"];
-	var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+	var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+		days   = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 	// Format a date according to user configuration.
 	var format_date = function(date) {
@@ -12732,11 +13557,7 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 
 		// Simple implementation of Go's time format. We only offer the current
 		// formatters, so that's all we support:
-		//   "2006-01-02"
-		//   "02-01-2006"
-		//   "01/02/06"
-		//   "2 Jan 06"
-		//   "Mon Jan 2 2006"
+		//   "2006-01-02", "02-01-2006", "01/02/06", "2 Jan 06", "Mon Jan 2 2006"
 		for (var i = 0; i < items.length; i++) {
 			switch (items[i]) {
 				case '2006': new_date.push(date.getFullYear());                  break;
@@ -12755,7 +13576,7 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 		else if (SETTINGS.date_format.indexOf(' ') > -1)
 			joiner = ' ';
 		return new_date.join(joiner);
-	};
+	}
 
 	// Format a date as year-month-day.
 	var format_date_ymd = function(date) {
@@ -12788,6 +13609,7 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 		data = data || {}
 		data['period-start'] = $('#period-start').val()
 		data['period-end']   = $('#period-end').val()
+		data['filter']       = $('#filter-paths').val()
 		return data
 	}
 
@@ -12809,12 +13631,12 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 		if (navigator.userAgent.match(/Mobile/i))
 			return true;
 		return window.innerWidth <= 800 && window.innerHeight <= 600;
-	};
+	}
 
 	// Quote special regexp characters. https://locutus.io/php/pcre/preg_quote/
 	var quote_re = function(s) {
 		return s.replace(new RegExp('[.\\\\+*?\\[\\^\\]$(){}=!<>|:\\-]', 'g'), '\\$&');
-	};
+	}
 
 	// Various stuff for the SQL stats page.
 	var pgstat = function() {
@@ -12859,6 +13681,10 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 			var form = $(this),
 				ta   = form.find('textarea')
 
+			var esc = function(v) {
+				return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+			}
+
 			jQuery.ajax({
 				method: 'POST',
 				url:    '/admin/sql/explain',
@@ -12866,8 +13692,8 @@ http://nicolasgallagher.com/micro-clearfix-hack/
 				success: function(data) {
 					form.after($('<pre class="e"></pre>').html(data).append('' +
 						'<form action="https://explain.dalibo.com/new" method="POST" target="_blank">' +
-							` + "`" + `<input type="hidden" name="plan"  value="${data}">` + "`" + ` +
-							` + "`" + `<input type="hidden" name="query" value="${form.find('textarea').val()}">` + "`" + ` +
+							` + "`" + `<input type="hidden" name="plan"  value="${esc(data)}">` + "`" + ` +
+							` + "`" + `<input type="hidden" name="query" value="${esc(form.find('textarea').val())}">` + "`" + ` +
 							'<button type="submit">PEV</button>' +
 						'</form>'))
 				}
@@ -13439,190 +14265,334 @@ h3 + h4          { margin-top: .3em; }
 }
 
 var SchemaPgSQL = []byte(`create table sites (
-	id             serial         primary key,
-	parent         integer        null                     check(parent is null or parent>0),
+	site_id        serial         primary key,
+	parent         integer        null,
 
 	code           varchar        not null                 check(length(code) >= 2 and length(code) <= 50),
 	link_domain    varchar        not null default ''      check(link_domain = '' or (length(link_domain) >= 4 and length(link_domain) <= 255)),
 	cname          varchar        null                     check(cname is null or (length(cname) >= 4 and length(cname) <= 255)),
-	cname_setup_at timestamp      default null,
+	cname_setup_at timestamp      default null             ,
 	plan           varchar        not null                 check(plan in ('personal', 'personalplus', 'business', 'businessplus', 'child', 'custom')),
 	stripe         varchar        null,
 	billing_amount varchar,
 	settings       json           not null,
-	received_data  int            not null default 0,
+	received_data  integer        not null default 0,
 
 	state          varchar        not null default 'a'     check(state in ('a', 'd')),
-	created_at     timestamp      not null,
-	updated_at     timestamp
+	created_at     timestamp      not null                 ,
+	updated_at     timestamp                               ,
+	first_hit_at   timestamp      not null                 
 );
-create unique index "sites#code"  on sites(lower(code));
-create unique index "sites#cname" on sites(lower(cname));
+create unique index "sites#code"   on sites(lower(code));
+create unique index "sites#cname"  on sites(lower(cname));
+create        index "sites#parent" on sites(parent) where state='a';
 
 create table users (
-	id             serial         primary key,
-	site           integer        not null                 check(site > 0),
+	user_id        serial         primary key,
+	site_id        integer        not null,
 
 	email          varchar        not null                 check(length(email) > 5 and length(email) <= 255),
 	email_verified integer        not null default 0,
 	password       bytea          default null,
 	totp_enabled   integer        not null default 0,
-	totp_secret    bytea,
+	totp_secret    bytea   ,
 	role           varchar        not null default ''      check(role in ('', 'a')),
-	login_at       timestamp      null,
+	login_at       timestamp      null                     ,
 	login_request  varchar        null,
 	login_token    varchar        null,
 	csrf_token     varchar        null,
 	email_token    varchar        null,
-	seen_updates_at timestamp     not null default current_timestamp,
+	seen_updates_at timestamp     not null default current_timestamp ,
 	reset_at       timestamp      null,
 
-	created_at     timestamp      not null,
-	updated_at     timestamp,
+	created_at     timestamp      not null                 ,
+	updated_at     timestamp                               ,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict
 );
-create        index "users#site"          on users(site);
-create unique index "users#site#email"    on users(site, lower(email));
+create        index "users#site_id"       on users(site_id);
+create unique index "users#site_id#email" on users(site_id, lower(email));
 
 create table api_tokens (
 	api_token_id   serial         primary key,
 	site_id        integer        not null,
 	user_id        integer        not null,
-	name           varchar        not null,
-	token          varchar        not null   check(length(token) > 10),
-	permissions    jsonb          not null,
-	created_at     timestamp      not null,
 
-	foreign key (site_id) references sites(id) on delete restrict on update restrict,
-	foreign key (user_id) references users(id) on delete restrict on update restrict
+	name           varchar        not null,
+	token          varchar        not null                 check(length(token) > 10),
+	permissions    jsonb          not null,
+	created_at     timestamp      not null                 ,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (user_id) references users(user_id) on delete restrict on update restrict
 );
 create unique index "api_tokens#site_id#token" on api_tokens(site_id, token);
 
 create table hits (
-	id             serial primary key,
-	site           integer        not null                 check(site > 0),
-	session        integer        default null,
-	session2       bytea          default null,
+	hit_id         serial         primary key,
+	-- No foreign keys on this as checking them for every insert is
+	-- comparatively expensive.
+	site_id        integer        not null                 check(site_id > 0),
+	path_id        integer        not null                 check(path_id > 0),
+	user_agent_id  integer        not null                 check(user_agent_id > 0),
 
-	path           varchar        not null,
-	title          varchar        not null default '',
-	event          int            default 0,
-	bot            int            default 0,
+	session        bytea          default null,
+	bot            integer        default 0,
 	ref            varchar        not null,
 	ref_scheme     varchar        null                     check(ref_scheme in ('h', 'g', 'o', 'c')),
-	browser        varchar        not null,
 	size           varchar        not null default '',
 	location       varchar        not null default '',
 	first_visit    integer        default 0,
 
-	created_at     timestamp      not null
+	created_at     timestamp      not null                 
 );
-create index "hits#site#bot#created_at" on hits(site, bot, created_at);
-create index "hits#site#path"           on hits(site, lower(path));
+create index "hits#site_id#created_at"     on hits(site_id, created_at);
+cluster hits using "hits#site_id#created_at";
 
-create table hit_stats (
-	site           integer        not null                 check(site > 0),
+create table paths (
+	path_id        serial         primary key,
+	site_id        integer        not null,
 
-	day            date           not null,
 	path           varchar        not null,
 	title          varchar        not null default '',
+	event          integer        default 0,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict
+);
+create unique index "paths#site_id#path" on paths(site_id, lower(path));
+create        index "paths#path#title"   on paths(lower(path), lower(title));
+
+create table browsers (
+	browser_id     serial         primary key,
+
+	name           varchar,
+	version        varchar
+);
+
+create table systems (
+	system_id      serial         primary key,
+
+	name           varchar,
+	version        varchar
+);
+
+create table user_agents (
+	user_agent_id  serial         primary key,
+	browser_id     integer        not null,
+	system_id      integer        not null,
+
+	ua             varchar        not null,
+	bot            integer        not null,
+
+	foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict,
+	foreign key (system_id)  references systems(system_id)   on delete restrict on update restrict
+);
+create unique index "user_agents#ua" on user_agents(ua);
+
+create table hit_counts (
+	site_id        integer        not null,
+	path_id        integer        not null,
+
+	hour           timestamp      not null                 ,
+	total          integer        not null,
+	total_unique   integer        not null,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict,
+	constraint "hit_counts#site_id#path_id#hour" unique(site_id, path_id, hour) 
+);
+create index "hit_counts#site_id#hour" on hit_counts(site_id, hour);
+cluster hit_counts using "hit_counts#site_id#hour";
+alter table hit_counts replica identity using index "hit_counts#site_id#path_id#hour";
+
+create table ref_counts (
+	site_id        integer        not null,
+	path_id        integer        not null,
+
+	ref            varchar        not null,
+	ref_scheme     varchar        null,
+	hour           timestamp      not null                 ,
+	total          integer        not null,
+	total_unique   integer        not null,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict,
+
+	constraint "ref_counts#site_id#path_id#ref#hour" unique(site_id, path_id, ref, hour) 
+);
+create index "ref_counts#site_id#hour" on ref_counts(site_id, hour);
+cluster ref_counts using "ref_counts#site_id#hour";
+alter table ref_counts replica identity using index "ref_counts#site_id#path_id#ref#hour";
+
+create table hit_stats (
+	site_id        integer        not null,
+	path_id        integer        not null,
+
+	day            date           not null                 ,
 	stats          varchar        not null,
 	stats_unique   varchar        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict
 );
-create index "hit_stats#site#day" on hit_stats(site, day);
-alter table hit_stats replica identity full;
-
-create table hit_counts (
-	site          int        not null check(site>0),
-	path          varchar    not null,
-	title         varchar    not null,
-	event         integer    not null default 0,
-	hour          timestamp  not null,
-	total         int        not null,
-	total_unique  int        not null,
-
-	constraint "hit_counts#site#path#hour" unique(site, path, hour)
-);
-create index "hit_counts#site#hour" on hit_counts(site, hour);
-alter table hit_counts replica identity using index "hit_counts#site#path#hour";
-
-create table ref_counts (
-	site          int        not null check(site>0),
-	path          varchar    not null,
-	ref           varchar    not null,
-	ref_scheme    varchar    null,
-	hour          timestamp  not null,
-	total         int        not null,
-	total_unique  int        not null,
-
-	constraint "ref_counts#site#path#ref#hour" unique(site, path, ref, hour)
-);
-create index "ref_counts#site#hour" on ref_counts(site, hour);
-alter table ref_counts replica identity using index "ref_counts#site#path#ref#hour";
+create unique index "hit_stats#site_id#path_id#day" on hit_stats(site_id, path_id, day);
+create index        "hit_stats#site_id#day"         on hit_stats(site_id, day);
+cluster hit_stats using "hit_stats#site_id#day";
+alter table hit_stats replica identity using index "hit_stats#site_id#path_id#day";
 
 create table browser_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
+	browser_id     integer        not null,
 
-	day            date           not null,
-	browser        varchar        not null,
-	version        varchar        not null,
-	count          int            not null,
-	count_unique   int            not null,
+	day            date           not null                 ,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id)    references sites(site_id)       on delete restrict on update restrict,
+	foreign key (path_id)    references paths(path_id)       on delete restrict on update restrict,
+	foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict
 );
-create index "browser_stats#site#day#browser" on browser_stats(site, day, browser);
-alter table browser_stats replica identity full;
+create unique index "browser_stats#site_id#path_id#day#browser_id" on browser_stats(site_id, path_id, day, browser_id);
+create index        "browser_stats#site_id#browser_id#day"         on browser_stats(site_id, browser_id, day);
+cluster browser_stats using "browser_stats#site_id#path_id#day#browser_id";
+alter table browser_stats replica identity using index "browser_stats#site_id#path_id#day#browser_id";
 
 create table system_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
+	system_id      integer        not null,
 
-	day            date           not null,
-	system         varchar        not null,
-	version        varchar        not null,
-	count          int            not null,
-	count_unique   int            not null,
+	day            date           not null                 ,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id)   references sites(site_id)     on delete restrict on update restrict,
+	foreign key (path_id)   references paths(path_id)     on delete restrict on update restrict,
+	foreign key (system_id) references systems(system_id) on delete restrict on update restrict
 );
-create index "system_stats#site#day"        on system_stats(site, day);
-create index "system_stats#site#day#system" on system_stats(site, day, system);
-alter table system_stats replica identity full;
+create unique index "system_stats#site_id#path_id#day#system_id" on system_stats(site_id, path_id, day, system_id);
+create index        "system_stats#site_id#system_id#day"         on system_stats(site_id, system_id, day);
+cluster system_stats using "system_stats#site_id#path_id#day#system_id";
+alter table system_stats replica identity using index "system_stats#site_id#path_id#day#system_id";
 
 create table location_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
 
-	day            date           not null,
+	day            date           not null                 ,
 	location       varchar        not null,
-	count          int            not null,
-	count_unique   int            not null,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict
 );
-create unique index "location_stats#site#day#location" on location_stats(site, day, location);
-alter table location_stats replica identity using index "location_stats#site#day#location";
+create unique index "location_stats#site_id#path_id#day#location" on location_stats(site_id, path_id, day, location);
+create index        "location_stats#site_id#day"                  on location_stats(site_id, day);
+cluster location_stats using "location_stats#site_id#day";
+alter table location_stats replica identity using index "location_stats#site_id#path_id#day#location";
 
 create table size_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
 
-	day            date           not null,
-	width          int            not null,
-	count          int            not null,
-	count_unique   int            not null,
+	day            date           not null                 ,
+	width          integer        not null,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict
 );
-create unique index "size_stats#site#day#width" on size_stats(site, day, width);
-alter table size_stats replica identity using index "size_stats#site#day#width";
+create unique index "size_stats#site_id#path_id#day#width" on size_stats(site_id, path_id, day, width);
+create index        "size_stats#site_id#day"               on size_stats(site_id, day);
+cluster size_stats using "size_stats#site_id#day";
+alter table size_stats replica identity using index "size_stats#site_id#path_id#day#width";
+
+create table updates (
+	id             serial         primary key,
+	subject        varchar        not null,
+	body           varchar        not null,
+
+	created_at     timestamp      not null                 ,
+	show_at        timestamp      not null                 
+);
+create index "updates#show_at" on updates(show_at);
+
+create table exports (
+	export_id      serial         primary key,
+	site_id        integer        not null,
+	start_from_hit_id integer     not null,
+
+	path           varchar        not null,
+	created_at     timestamp      not null                 ,
+
+	finished_at    timestamp                               ,
+	last_hit_id    integer,
+	num_rows       integer,
+	size           varchar,
+	hash           varchar,
+	error          varchar,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict
+);
+create index "exports#site_id#created_at" on exports(site_id, created_at);
+
+create table store (
+	key            varchar        not null,
+	value          text
+);
+create unique index "store#key" on store(key);
+alter table store replica identity using index "store#key";
+
+create view view_user_agents as
+	select
+		user_agents.user_agent_id as id,
+		user_agents.system_id     as bid,
+		user_agents.browser_id    as sid,
+		user_agents.bot,
+		browsers.name || ' ' || browsers.version as browser,
+		systems.name  || ' ' || systems.version as system,
+		user_agents.ua
+	from user_agents
+	join browsers using (browser_id)
+	join systems using (system_id);
+
+create view hits_export as
+	select
+		hits.hit_id,
+		hits.site_id,
+
+		paths.path,
+		paths.title,
+		paths.event,
+
+		user_agents.ua,
+		browsers.name || ' ' || browsers.version as browser,
+		systems.name || ' ' || systems.version as system,
+
+		hits.session,
+		hits.bot,
+		hits.ref,
+		hits.ref_scheme as ref_s,
+		hits.size,
+		hits.location as loc,
+		hits.first_visit as first,
+		hits.created_at
+	from hits
+	join paths       using (site_id, path_id)
+	join user_agents using (user_agent_id)
+	join browsers    using (browser_id)
+	join systems     using (system_id)
+	order by hit_id asc;
 
 create table iso_3166_1 (
-	name   varchar,
-	alpha2 varchar
+	name           varchar,
+	alpha2          varchar
 );
 create unique index "iso_3166_1#alpha2" on iso_3166_1(alpha2);
+
 insert into iso_3166_1 (name, alpha2) values
 	('(unknown)', ''),
 
@@ -13916,85 +14886,21 @@ insert into iso_3166_1 (name, alpha2) values
 	('Zaire', 'ZR'),
 	('Zimbabwe', 'ZW');
 
-create table updates (
-	id             serial         primary key,
-	subject        varchar        not null,
-	body           varchar        not null,
-
-	created_at     timestamp      not null,
-	show_at        timestamp      not null
-);
-create index "updates#show_at" on updates(show_at);
-
-create table botlog_ips (
-	id             serial         primary key,
-
-	count          int            not null default 1,
-	ip             varchar        not null,
-	ptr            varchar,
-	info           varchar,
-	hide           int            default 0,
-
-	created_at     timestamp      not null,
-	last_seen      timestamp      not null,
-
-	constraint "botlog_ips#ip" unique(ip)
-);
-
-create table botlog (
-	id             serial         primary key,
-
-	ip             int            not null,
-	bot            int            not null,
-	ua             varchar        not null,
-	headers        jsonb          not null,
-	url            varchar        not null,
-	created_at     timestamp      not null,
-
-	foreign key (ip) references botlog_ips(id)
-);
-
-create table exports (
-	export_id         serial         primary key,
-	site_id           integer        not null,
-	start_from_hit_id integer        not null,
-
-	path              varchar        not null,
-	created_at        timestamp      not null,
-
-	finished_at       timestamp,
-	last_hit_id       integer,
-	num_rows          integer,
-	size              varchar,
-	hash              varchar,
-	error             varchar,
-
-	foreign key (site_id) references sites(id) on delete restrict on update restrict
-);
-create index "exports#site_id#created_at" on exports(site_id, created_at);
-
-create table store (
-	key     varchar not null,
-	value   text
-);
-create unique index "store#key" on store(key);
-alter table store replica identity using index "store#key";
-
 create table version (name varchar);
 insert into version values
 	('2020-03-18-1-json_settings'),
-	('2020-03-29-1-page_cost'),
-	('2020-03-27-1-isbot'),
 	('2020-03-24-1-sessions'),
+	('2020-03-27-1-isbot'),
 	('2020-03-29-1-page_cost'),
 	('2020-04-06-1-event'),
 	('2020-04-16-1-pwauth'),
 	('2020-04-20-1-hitsindex'),
 	('2020-04-22-1-campaigns'),
 	('2020-04-27-1-usage-flags'),
+	('2020-04-28-1-fix'),
 	('2020-05-13-1-unique-path'),
-	('2020-05-17-1-rm-user-name'),
 	('2020-05-16-1-os_stats'),
+	('2020-05-17-1-rm-user-name'),
 	('2020-05-18-1-domain-count'),
 	('2020-05-21-1-ref-count'),
 	('2020-05-23-1-botlog'),
@@ -14009,15 +14915,22 @@ insert into version values
 	('2020-07-21-1-memsess'),
 	('2020-07-22-1-memsess'),
 	('2020-08-01-1-repl'),
-	('2020-08-24-1-iso_unique');
+	('2020-08-24-1-iso_unique'),
+	('2020-08-28-1-paths-tables'),
+	('2020-08-28-2-paths-paths'),
+	('2020-08-28-3-paths-rmold'),
+	('2020-08-28-4-user_agents'),
+	('2020-08-28-5-paths-ua-fk'),
+	('2020-08-28-6-paths-views');
 
--- vim:ft=sql
+
+-- vim:ft=sql:tw=0
 `)
 var SchemaSQLite = []byte(`create table sites (
-	id             integer        primary key autoincrement,
-	parent         integer        null                     check(parent is null or parent>0),
+	site_id        integer        primary key autoincrement,
+	parent         integer        null,
 
-	code           varchar        not null                 check(length(code) >= 2   and length(code) <= 50),
+	code           varchar        not null                 check(length(code) >= 2 and length(code) <= 50),
 	link_domain    varchar        not null default ''      check(link_domain = '' or (length(link_domain) >= 4 and length(link_domain) <= 255)),
 	cname          varchar        null                     check(cname is null or (length(cname) >= 4 and length(cname) <= 255)),
 	cname_setup_at timestamp      default null             check(cname_setup_at = strftime('%Y-%m-%d %H:%M:%S', cname_setup_at)),
@@ -14025,171 +14938,323 @@ var SchemaSQLite = []byte(`create table sites (
 	stripe         varchar        null,
 	billing_amount varchar,
 	settings       varchar        not null,
-	received_data  int            not null default 0,
+	received_data  integer        not null default 0,
 
 	state          varchar        not null default 'a'     check(state in ('a', 'd')),
 	created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
-	updated_at     timestamp                               check(updated_at = strftime('%Y-%m-%d %H:%M:%S', updated_at))
+	updated_at     timestamp                               check(updated_at = strftime('%Y-%m-%d %H:%M:%S', updated_at)),
+	first_hit_at   timestamp      not null                 check(first_hit_at = strftime('%Y-%m-%d %H:%M:%S', first_hit_at))
 );
-create unique index "sites#code" on sites(lower(code));
+create unique index "sites#code"   on sites(lower(code));
+create unique index "sites#cname"  on sites(lower(cname));
+create        index "sites#parent" on sites(parent) where state='a';
 
 create table users (
-	id             integer        primary key autoincrement,
-	site           integer        not null                 check(site > 0),
+	user_id        integer        primary key autoincrement,
+	site_id        integer        not null,
 
 	email          varchar        not null                 check(length(email) > 5 and length(email) <= 255),
-	email_verified int            not null default 0,
+	email_verified integer        not null default 0,
 	password       blob           default null,
 	totp_enabled   integer        not null default 0,
-	totp_secret    blob,
+	totp_secret    blob    ,
 	role           varchar        not null default ''      check(role in ('', 'a')),
 	login_at       timestamp      null                     check(login_at = strftime('%Y-%m-%d %H:%M:%S', login_at)),
 	login_request  varchar        null,
 	login_token    varchar        null,
 	csrf_token     varchar        null,
 	email_token    varchar        null,
-	seen_updates_at timestamp     not null default '1970-01-01 00:00:00' check(seen_updates_at = strftime('%Y-%m-%d %H:%M:%S', seen_updates_at)),
+	seen_updates_at timestamp     not null default current_timestamp check(seen_updates_at = strftime('%Y-%m-%d %H:%M:%S', seen_updates_at)),
 	reset_at       timestamp      null,
 
 	created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
 	updated_at     timestamp                               check(updated_at = strftime('%Y-%m-%d %H:%M:%S', updated_at)),
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict
 );
-create        index "users#site"          on users(site);
-create unique index "users#site#email"    on users(site, lower(email));
+create        index "users#site_id"       on users(site_id);
+create unique index "users#site_id#email" on users(site_id, lower(email));
 
 create table api_tokens (
 	api_token_id   integer        primary key autoincrement,
 	site_id        integer        not null,
 	user_id        integer        not null,
-	name           varchar        not null,
-	token          varchar        not null    check(length(token) > 10),
-	permissions    jsonb          not null,
-	created_at     timestamp      not null    check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
 
-	foreign key (site_id) references sites(id) on delete restrict on update restrict,
-	foreign key (user_id) references users(id) on delete restrict on update restrict
+	name           varchar        not null,
+	token          varchar        not null                 check(length(token) > 10),
+	permissions    varchar        not null,
+	created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (user_id) references users(user_id) on delete restrict on update restrict
 );
 create unique index "api_tokens#site_id#token" on api_tokens(site_id, token);
 
 create table hits (
-	id             integer        primary key autoincrement,
-	site           integer        not null                 check(site > 0),
-	session        integer        default null,
-	session2       blob           default null,
+	hit_id         integer        primary key autoincrement,
+	-- No foreign keys on this as checking them for every insert is
+	-- comparatively expensive.
+	site_id        integer        not null                 check(site_id > 0),
+	path_id        integer        not null                 check(path_id > 0),
+	user_agent_id  integer        not null                 check(user_agent_id > 0),
 
-	path           varchar        not null,
-	title          varchar        not null default '',
-	event          int            default 0,
-	bot            int            default 0,
+	session        blob           default null,
+	bot            integer        default 0,
 	ref            varchar        not null,
 	ref_scheme     varchar        null                     check(ref_scheme in ('h', 'g', 'o', 'c')),
-	browser        varchar        not null,
 	size           varchar        not null default '',
 	location       varchar        not null default '',
-	first_visit    int            default 0,
+	first_visit    integer        default 0,
 
 	created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at))
 );
-create index "hits#site#bot#created_at"      on hits(site, bot, created_at);
-create index "hits#site#path"                on hits(site, lower(path));
+create index "hits#site_id#created_at"     on hits(site_id, created_at);
 
-create table hit_stats (
-	site           integer        not null                 check(site > 0),
 
-	day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
+create table paths (
+	path_id        integer        primary key autoincrement,
+	site_id        integer        not null,
+
 	path           varchar        not null,
 	title          varchar        not null default '',
+	event          integer        default 0,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict
+);
+create unique index "paths#site_id#path" on paths(site_id, lower(path));
+create        index "paths#path#title"   on paths(lower(path), lower(title));
+
+create table browsers (
+	browser_id     integer        primary key autoincrement,
+
+	name           varchar,
+	version        varchar
+);
+
+create table systems (
+	system_id      integer        primary key autoincrement,
+
+	name           varchar,
+	version        varchar
+);
+
+create table user_agents (
+	user_agent_id  integer        primary key autoincrement,
+	browser_id     integer        not null,
+	system_id      integer        not null,
+
+	ua             varchar        not null,
+	bot            integer        not null,
+
+	foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict,
+	foreign key (system_id)  references systems(system_id)   on delete restrict on update restrict
+);
+create unique index "user_agents#ua" on user_agents(ua);
+
+create table hit_counts (
+	site_id        integer        not null,
+	path_id        integer        not null,
+
+	hour           timestamp      not null                 check(hour = strftime('%Y-%m-%d %H:%M:%S', hour)),
+	total          integer        not null,
+	total_unique   integer        not null,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict,
+	constraint "hit_counts#site_id#path_id#hour" unique(site_id, path_id, hour) on conflict replace
+);
+create index "hit_counts#site_id#hour" on hit_counts(site_id, hour);
+
+
+
+create table ref_counts (
+	site_id        integer        not null,
+	path_id        integer        not null,
+
+	ref            varchar        not null,
+	ref_scheme     varchar        null,
+	hour           timestamp      not null                 check(hour = strftime('%Y-%m-%d %H:%M:%S', hour)),
+	total          integer        not null,
+	total_unique   integer        not null,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict,
+
+	constraint "ref_counts#site_id#path_id#ref#hour" unique(site_id, path_id, ref, hour) on conflict replace
+);
+create index "ref_counts#site_id#hour" on ref_counts(site_id, hour);
+
+
+
+create table hit_stats (
+	site_id        integer        not null,
+	path_id        integer        not null,
+
+	day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
 	stats          varchar        not null,
 	stats_unique   varchar        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict
 );
-create index "hit_stats#site#day" on hit_stats(site, day);
+create unique index "hit_stats#site_id#path_id#day" on hit_stats(site_id, path_id, day);
+create index        "hit_stats#site_id#day"         on hit_stats(site_id, day);
 
-create table hit_counts (
-	site          int        not null check(site>0),
-	path          varchar    not null,
-	title         varchar    not null,
-	event         integer    not null default 0,
-	hour          timestamp  not null check(hour = strftime('%Y-%m-%d %H:%M:%S', hour)),
-	total         int        not null,
-	total_unique  int        not null,
 
-	constraint "hit_counts#site#path#hour" unique(site, path, hour) on conflict replace
-);
-create index "hit_counts#site#hour" on hit_counts(site, hour);
-
-create table ref_counts (
-	site          int        not null check(site>0),
-	path          varchar    not null,
-	ref           varchar    not null,
-	ref_scheme    varchar    null,
-	hour          timestamp  not null check(hour = strftime('%Y-%m-%d %H:%M:%S', hour)),
-	total         int        not null,
-	total_unique  int        not null,
-
-	constraint "ref_counts#site#path#ref#hour" unique(site, path, ref, hour) on conflict replace
-);
-create index "ref_counts#site#hour" on ref_counts(site, hour);
 
 create table browser_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
+	browser_id     integer        not null,
 
 	day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
-	browser        varchar        not null,
-	version        varchar        not null,
-	count          int            not null,
-	count_unique   int            not null,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id)    references sites(site_id)       on delete restrict on update restrict,
+	foreign key (path_id)    references paths(path_id)       on delete restrict on update restrict,
+	foreign key (browser_id) references browsers(browser_id) on delete restrict on update restrict
 );
-create index "browser_stats#site#day#browser" on browser_stats(site, day, browser);
+create unique index "browser_stats#site_id#path_id#day#browser_id" on browser_stats(site_id, path_id, day, browser_id);
+create index        "browser_stats#site_id#browser_id#day"         on browser_stats(site_id, browser_id, day);
+
+
 
 create table system_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
+	system_id      integer        not null,
 
 	day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
-	system         varchar        not null,
-	version        varchar        not null,
-	count          int            not null,
-	count_unique   int            not null,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id)   references sites(site_id)     on delete restrict on update restrict,
+	foreign key (path_id)   references paths(path_id)     on delete restrict on update restrict,
+	foreign key (system_id) references systems(system_id) on delete restrict on update restrict
 );
-create index "system_stats#site#day"        on system_stats(site, day);
-create index "system_stats#site#day#system" on system_stats(site, day, system);
+create unique index "system_stats#site_id#path_id#day#system_id" on system_stats(site_id, path_id, day, system_id);
+create index        "system_stats#site_id#system_id#day"         on system_stats(site_id, system_id, day);
+
+
 
 create table location_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
 
 	day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
 	location       varchar        not null,
-	count          int            not null,
-	count_unique   int            not null,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict
 );
-create unique index "location_stats#site#day#location" on location_stats(site, day, location);
+create unique index "location_stats#site_id#path_id#day#location" on location_stats(site_id, path_id, day, location);
+create index        "location_stats#site_id#day"                  on location_stats(site_id, day);
+
+
 
 create table size_stats (
-	site           integer        not null                 check(site > 0),
+	site_id        integer        not null,
+	path_id        integer        not null,
 
 	day            date           not null                 check(day = strftime('%Y-%m-%d', day)),
-	width          int            not null,
-	count          int            not null,
-	count_unique   int            not null,
+	width          integer        not null,
+	count          integer        not null,
+	count_unique   integer        not null,
 
-	foreign key (site) references sites(id) on delete restrict on update restrict
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict,
+	foreign key (path_id) references paths(path_id) on delete restrict on update restrict
 );
-create unique index "size_stats#site#day#width" on size_stats(site, day, width);
+create unique index "size_stats#site_id#path_id#day#width" on size_stats(site_id, path_id, day, width);
+create index        "size_stats#site_id#day"               on size_stats(site_id, day);
+
+
+
+create table updates (
+	id             integer        primary key autoincrement,
+	subject        varchar        not null,
+	body           varchar        not null,
+
+	created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
+	show_at        timestamp      not null                 check(show_at = strftime('%Y-%m-%d %H:%M:%S', show_at))
+);
+create index "updates#show_at" on updates(show_at);
+
+create table exports (
+	export_id      integer        primary key autoincrement,
+	site_id        integer        not null,
+	start_from_hit_id integer     not null,
+
+	path           varchar        not null,
+	created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
+
+	finished_at    timestamp                               check(finished_at is null or finished_at = strftime('%Y-%m-%d %H:%M:%S', finished_at)),
+	last_hit_id    integer,
+	num_rows       integer,
+	size           varchar,
+	hash           varchar,
+	error          varchar,
+
+	foreign key (site_id) references sites(site_id) on delete restrict on update restrict
+);
+create index "exports#site_id#created_at" on exports(site_id, created_at);
+
+create table store (
+	key            varchar        not null,
+	value          text
+);
+create unique index "store#key" on store(key);
+
+
+create view view_user_agents as
+	select
+		user_agents.user_agent_id as id,
+		user_agents.system_id     as bid,
+		user_agents.browser_id    as sid,
+		user_agents.bot,
+		browsers.name || ' ' || browsers.version as browser,
+		systems.name  || ' ' || systems.version as system,
+		user_agents.ua
+	from user_agents
+	join browsers using (browser_id)
+	join systems using (system_id);
+
+create view hits_export as
+	select
+		hits.hit_id,
+		hits.site_id,
+
+		paths.path,
+		paths.title,
+		paths.event,
+
+		user_agents.ua,
+		browsers.name || ' ' || browsers.version as browser,
+		systems.name || ' ' || systems.version as system,
+
+		hits.session,
+		hits.bot,
+		hits.ref,
+		hits.ref_scheme as ref_s,
+		hits.size,
+		hits.location as loc,
+		hits.first_visit as first,
+		hits.created_at
+	from hits
+	join paths       using (site_id, path_id)
+	join user_agents using (user_agent_id)
+	join browsers    using (browser_id)
+	join systems     using (system_id)
+	order by hit_id asc;
 
 create table iso_3166_1 (
-	name   varchar,
-	alpha2 varchar
+	name           varchar,
+	alpha2          varchar
 );
 create unique index "iso_3166_1#alpha2" on iso_3166_1(alpha2);
+
 insert into iso_3166_1 (name, alpha2) values
 	('(unknown)', ''),
 
@@ -14483,55 +15548,24 @@ insert into iso_3166_1 (name, alpha2) values
 	('Zaire', 'ZR'),
 	('Zimbabwe', 'ZW');
 
-create table updates (
-	id             integer        primary key autoincrement,
-	subject        varchar        not null,
-	body           varchar        not null,
-
-	created_at     timestamp      not null                 check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
-	show_at        timestamp      not null                 check(show_at = strftime('%Y-%m-%d %H:%M:%S', show_at))
-);
-create index "updates#show_at" on updates(show_at);
-
-create table exports (
-	export_id         integer        primary key autoincrement,
-	site_id           integer        not null,
-	start_from_hit_id integer        not null,
-
-	path              varchar        not null,
-	created_at        timestamp      not null    check(created_at = strftime('%Y-%m-%d %H:%M:%S', created_at)),
-
-	finished_at       timestamp                  check(finished_at is null or finished_at = strftime('%Y-%m-%d %H:%M:%S', finished_at)),
-	last_hit_id       integer,
-	num_rows          integer,
-	size              varchar,
-	hash              varchar,
-	error             varchar,
-
-	foreign key (site_id) references sites(id) on delete restrict on update restrict
-);
-create index "exports#site_id#created_at" on exports(site_id, created_at);
-
-create table store (
-	key     varchar not null,
-	value   text
-);
-create unique index "store#key" on store(key);
-
 create table version (name varchar);
 insert into version values
-	('2020-03-27-1-isbot'),
+	('2020-03-18-1-json_settings'),
 	('2020-03-24-1-sessions'),
+	('2020-03-27-1-isbot'),
+	('2020-03-29-1-page_cost'),
 	('2020-04-06-1-event'),
 	('2020-04-16-1-pwauth'),
+	('2020-04-20-1-hitsindex'),
 	('2020-04-22-1-campaigns'),
 	('2020-04-27-1-usage-flags'),
 	('2020-04-28-1-fix'),
 	('2020-05-13-1-unique-path'),
-	('2020-05-17-1-rm-user-name'),
 	('2020-05-16-1-os_stats'),
+	('2020-05-17-1-rm-user-name'),
 	('2020-05-18-1-domain-count'),
 	('2020-05-21-1-ref-count'),
+	('2020-05-23-1-botlog'),
 	('2020-05-23-1-event'),
 	('2020-05-23-1-index'),
 	('2020-05-23-2-drop-ref-stats'),
@@ -14543,7 +15577,16 @@ insert into version values
 	('2020-07-21-1-memsess'),
 	('2020-07-22-1-memsess'),
 	('2020-08-01-1-repl'),
-	('2020-08-24-1-iso_unique');
+	('2020-08-24-1-iso_unique'),
+	('2020-08-28-1-paths-tables'),
+	('2020-08-28-2-paths-paths'),
+	('2020-08-28-3-paths-rmold'),
+	('2020-08-28-4-user_agents'),
+	('2020-08-28-5-paths-ua-fk'),
+	('2020-08-28-6-paths-views');
+
+
+-- vim:ft=sql:tw=0
 `)
 var Templates = map[string][]byte{
 	"tpl/_backend_bottom.gohtml": []byte(`	</div> {{- /* .page */}}
@@ -14569,7 +15612,7 @@ var Templates = map[string][]byte{
 	{{end}}
 	<span id="js-settings"
 		data-offset="{{.Site.Settings.Timezone.Offset}}"
-		data-created="{{.Site.CreatedAt.Unix}}"
+		data-first-hit-at="{{.Site.FirstHitAt.Unix}}"
 		{{if .User.ID}}data-csrf="{{.User.CSRFToken}}"{{end}}
 	>
 		{{- .Site.Settings.String | unsafe_js -}}
@@ -15460,7 +16503,7 @@ want to modify that in JavaScript; you can use <code>goatcounter.endpoint</code>
 
 `),
 	"tpl/_dashboard_pages_rows.gohtml": []byte(`{{range $i, $h := .Pages}}
-	<tr id="{{$h.Path}}"{{if eq $h.Path $.ShowRefs}}class="target"{{end}}>
+	<tr id="{{$h.Path}}" data-id="{{$h.PathID}}" {{if eq $h.Path $.ShowRefs}}class="target"{{end}}>
 		<td class="col-count">
 			<span title="{{nformat $h.Count $.Site}} pageviews">{{nformat $h.CountUnique $.Site}}</span>
 		</td>
@@ -15522,7 +16565,7 @@ want to modify that in JavaScript; you can use <code>goatcounter.endpoint</code>
 </div>
 `),
 	"tpl/_dashboard_pages_text_rows.gohtml": []byte(`{{range $i, $h := .Pages}}
-	<tr id="{{$h.Path}}"{{if eq $h.Path $.ShowRefs}}class="target"{{end}}>
+	<tr id="{{$h.Path}}" data-id="{{$h.PathID}}" {{if eq $h.Path $.ShowRefs}}class="target"{{end}}>
 		<td class="col-idx">{{sum $.Offset $i}}</td>
 		<td class="col-n col-count">{{nformat $h.CountUnique $.Site}}</td>
 		<td class="col-n">{{nformat $h.Count $.Site}}</td>
@@ -15583,6 +16626,19 @@ want to modify that in JavaScript; you can use <code>goatcounter.endpoint</code>
 		</div>
 	</td>
 </tr></tbody>
+`),
+	"tpl/_dashboard_widgets.gohtml": []byte(`<div id="dash-widgets">
+	{{$div := false}}
+	{{range $w := .Widgets}}
+		{{if and (eq $w.Type "hchart") (not $div)}}
+			{{$div = true}}
+			<div class="hcharts">
+		{{end}}
+		{{if and (ne $w.Type "hchart") $div}}</div>{{end}}
+		{{$w.HTML}}
+	{{end}}
+	{{if $div}}</div>{{end}}
+</div>
 `),
 	"tpl/_email_bottom.gotxt": []byte(`Any problems, questions, comments, or something else to tell me? Just reply to this email.
 
@@ -16738,6 +17794,8 @@ pageview.</p>
 <p></p>
 <h4>updated_at <sup>string [format: date-time]</sup></h4>
 <p></p>
+<h4>first_hit_at <sup>string [format: date-time]</sup></h4>
+<p></p>
 
 		</div>
 		<h3 id="goatcounter.SiteSettings">goatcounter.SiteSettings <a class="permalink" href="#goatcounter.SiteSettings">§</a></h3>
@@ -17517,6 +18575,10 @@ depending on whether daylight savings time is in use at the time instant.</p>
           "type": "string",
           "format": "date-time"
         },
+        "first_hit_at": {
+          "type": "string",
+          "format": "date-time"
+        },
         "id": {
           "type": "integer",
           "readOnly": true
@@ -17875,6 +18937,7 @@ depending on whether daylight savings time is in use at the time instant.</p>
 
 	<form method="post">
 		<input type="hidden" name="csrf" value="{{.User.CSRFToken}}">
+		<input type="hidden" name="paths" value="{{range $s := .List}}{{$s.PathID}},{{end}}">
 		<button>Yes, purge them all!</button>
 		<strong>This is a destructive operation, and cannot be undone!</strong>
 	</form>
@@ -18129,10 +19192,6 @@ depending on whether daylight savings time is in use at the time instant.</p>
 		<code>\%</code> and <code>\_</code> for the literal characters without special
 		meaning.</p>
 
-	<p><strong>This won’t adjust the browser or location statistics, as they’re not
-		stored per-path.</strong>They will be cleared if you remove all paths
-		though (using <code>%</code>, or if there are no more paths left).</p>
-
 	<form method="get" action="/purge">
 		<input type="text" name="path" placeholder="Path" required autocomplete="off">
 		<button type="submit">Purge</button>
@@ -18189,17 +19248,19 @@ depending on whether daylight savings time is in use at the time instant.</p>
 	<h3>CSV format</h3>
 	<p>The first line is a header with the field names. The fields, in order, are:</p>
 	<table class="table-left">
-		<tr><th>1,Path</th><td>Path name (e.g. <code>/a.html</code>).
+		<tr><th>2,Path</th><td>Path name (e.g. <code>/a.html</code>).
 			This also doubles as the event name. This header is prefixed
 			with the version export format (see versioning below).</td></tr>
 		<tr><th>Title</th><td>Page title that was sent.</td></tr>
 		<tr><th>Event</th><td>If this is an event; <code>true</code> or <code>false</code>.</td></tr>
+		<tr><th>User-Agent</th><td><code>User-Agent</code> header.</td></tr>
+		<tr><th>Browser</th><td>Browser name and version.</td></tr>
+		<tr><th>System</th><td>System name and version.</td></tr>
+		<tr><th>Session</th><td>The session ID, to track unique visitors.</td>
 		<tr><th>Bot</th><td>If this is a bot request; <code>0</code> if it's
 			not, or one of the
 			<a href="https://pkg.go.dev/zgo.at/isbot?tab=doc#pkg-constants">isbot</a>
 			constants if it is.</td></tr>
-		<tr><th>Session</th><td>The session ID, to track unique visitors.</td>
-		<tr><th>FirstVisit</th><td>First visit in this session?</td>
 		<tr><th>Referrer</th><td>Referrer data.</td></tr>
 		<tr><th>Referrer scheme</th><td>
 				<code>h</code> – HTTP; an URL;<br>
@@ -18208,9 +19269,9 @@ depending on whether daylight savings time is in use at the time instant.</p>
 				<code>c</code> – Campaign; text string from a campaign parameter;<br>
 				<code>o</code> – Other (e.g. Android apps).
 			</td></tr>
-		<tr><th>Browser</th><td><code>User-Agent</code> header.</td></tr>
 		<tr><th>Screen size</th><td>Screen size as <code>x,y,scaling</code>.</td></tr>
 		<tr><th>Location</th><td>ISO 3166-1 country code.</td></tr>
+		<tr><th>FirstVisit</th><td>First visit in this session?</td>
 		<tr><th>Date</th><td>Creation date as RFC 3339/ISO 8601.</td></tr>
 	</table>
 
@@ -18221,6 +19282,38 @@ depending on whether daylight savings time is in use at the time instant.</p>
 	<p>It’s <strong>strongly recommended</strong> to check this number if you're
 	using a script to import/sync data and error out if it changes. Any future
 	incompatibilities will be documented here.</p>
+
+
+	<details>
+		<summary>Version 1 documentation</summary>
+
+		<p>The first line is a header with the field names. The fields, in order, are:</p>
+		<table class="table-left">
+			<tr><th>1,Path</th><td>Path name (e.g. <code>/a.html</code>).
+				This also doubles as the event name. This header is prefixed
+				with the version export format (see versioning below).</td></tr>
+			<tr><th>Title</th><td>Page title that was sent.</td></tr>
+			<tr><th>Event</th><td>If this is an event; <code>true</code> or <code>false</code>.</td></tr>
+			<tr><th>Bot</th><td>If this is a bot request; <code>0</code> if it's
+				not, or one of the
+				<a href="https://pkg.go.dev/zgo.at/isbot?tab=doc#pkg-constants">isbot</a>
+				constants if it is.</td></tr>
+			<tr><th>Session</th><td>The session ID, to track unique visitors.</td>
+			<tr><th>FirstVisit</th><td>First visit in this session?</td>
+			<tr><th>Referrer</th><td>Referrer data.</td></tr>
+			<tr><th>Referrer scheme</th><td>
+					<code>h</code> – HTTP; an URL;<br>
+					<code>g</code> – Generated; e.g. all the various Hacker News interfaces don't
+					add a link to the specific story, so are just recorded as “Hacker News”;<br>
+					<code>c</code> – Campaign; text string from a campaign parameter;<br>
+					<code>o</code> – Other (e.g. Android apps).
+				</td></tr>
+			<tr><th>Browser</th><td><code>User-Agent</code> header.</td></tr>
+			<tr><th>Screen size</th><td>Screen size as <code>x,y,scaling</code>.</td></tr>
+			<tr><th>Location</th><td>ISO 3166-1 country code.</td></tr>
+			<tr><th>Date</th><td>Creation date as RFC 3339/ISO 8601.</td></tr>
+		</table>
+	</details>
 </div>
 
 <div class="tab-page">
@@ -18689,16 +19782,7 @@ processed by Stripe (you will need a Credit Card).</p>
 	</div>
 </form>
 
-{{$div := false}}
-{{range $w := .Widgets}}
-	{{if and (eq $w.Type "hchart") (not $div)}}
-		{{$div = true}}
-		<div class="hcharts">
-	{{end}}
-	{{if and (ne $w.Type "hchart") $div}}</div>{{end}}
-	{{$w.HTML}}
-{{end}}
-{{if $div}}</div>{{end}}
+{{template "_dashboard_widgets.gohtml" .}}
 
 {{- template "_backend_bottom.gohtml" . }}
 `),
